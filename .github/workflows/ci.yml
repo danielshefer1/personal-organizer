@@ -43,9 +43,6 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        # Matches Railway's managed image on what matters: PG16 + pgvector 0.8 (HNSW).
-        # Railway's own postgres-ssl:16 has a custom SSL entrypoint that does not behave
-        # as a bare service container; po-db bootstrap asserts the pgvector floor anyway.
         image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: postgres

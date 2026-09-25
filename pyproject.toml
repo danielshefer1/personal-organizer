@@ -7,7 +7,34 @@ authors = [
     { name = "Daniel Shefer", email = "dandanshefer@gmail.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "alembic>=1.20.0",
+    "anthropic>=1.8.0",
+    "asyncpg>=0.31.0",
+    "composio>=0.24.0",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "icalendar>=7.3.0",
+    "itsdangerous>=2.2.0",
+    "jinja2>=3.1.6",
+    "langfuse>=4.15.6",
+    "litellm==1.102.1",
+    "openai>=2.54.0",
+    "openpyxl>=3.1.5",
+    "pgvector>=0.5.0",
+    "procrastinate>=3.10.0",
+    "psycopg[binary]>=3.3.6",
+    "puremagic>=2.2.0",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "pypdf>=6.19.0",
+    "python-docx>=1.2.0",
+    "sentry-sdk>=2.70.0",
+    "sqlalchemy[asyncio]>=2.1.0",
+    "structlog>=26.1.0",
+    "tenacity>=9.1.4",
+    "uvicorn[standard]>=0.54.0",
+]
 
 [project.scripts]
 personal-organizer = "personal_organizer:main"
@@ -15,3 +42,12 @@ personal-organizer = "personal_organizer:main"
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "locust>=2.46.6",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.9",
+]

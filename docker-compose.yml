@@ -1,0 +1,27 @@
+# Local Postgres for the test suite and local development.
+#
+# This holds no real data: staging and production databases live on Railway. The DB tests
+# TRUNCATE between cases, so they can never be pointed at a deployed database.
+#
+# pgvector/pgvector:pg16 matches Railway's managed image (postgres-ssl:16, which bundles
+# postgresql-16-pgvector 0.8.*) on the two things that matter: PostgreSQL 16 and pgvector
+# 0.8 with HNSW support.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: po-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      # 5433 on the host, so this never collides with a system Postgres on 5432.
+      - "5433:5432"
+    volumes:
+      - ./.pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

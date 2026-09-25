@@ -8,3 +8,25 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+
+# Tool caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local Postgres data (docker compose volume)
+.pgdata/
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

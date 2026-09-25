@@ -1,7 +1,7 @@
 [project]
 name = "personal-organizer"
 version = "0.1.0"
-description = "Add your description here"
+description = "WhatsApp AI personal organizer: calendar, reminders and long-term memory over WhatsApp."
 readme = "README.md"
 authors = [
     { name = "Daniel Shefer", email = "dandanshefer@gmail.com" }
@@ -22,7 +22,9 @@ dependencies = [
     "openai>=2.54.0",
     "openpyxl>=3.1.5",
     "pgvector>=0.5.0",
-    "procrastinate>=3.10.0",
+    # Pinned to the minor: alembic/vendor/procrastinate_3.10.sql is a verbatim copy of this
+    # version's schema.sql. tests/worker/test_procrastinate_schema.py fails if they drift.
+    "procrastinate==3.10.*",
     "psycopg[binary]>=3.3.6",
     "puremagic>=2.2.0",
     "pydantic>=2.13.5",
@@ -37,7 +39,8 @@ dependencies = [
 ]
 
 [project.scripts]
-personal-organizer = "personal_organizer:main"
+po-db = "personal_organizer.db.cli:main"
+po-worker = "personal_organizer.worker.main:main"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
@@ -47,7 +50,88 @@ build-backend = "uv_build"
 dev = [
     "locust>=2.46.6",
     "mypy>=2.3.1",
+    "pre-commit>=4.6.2",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.0.0",
     "ruff>=0.16.9",
 ]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",      # pycodestyle / pyflakes
+    "I",                # isort
+    "N",                # pep8-naming
+    "UP",               # pyupgrade
+    "B",                # bugbear
+    "A",                # builtins shadowing
+    "C4",               # comprehensions
+    "DTZ",              # naive datetimes
+    "T20",              # no print()
+    "SIM",              # simplify
+    "TID",              # tidy imports (layering, below)
+    "RUF",
+    "ASYNC",
+    "S",                # bandit
+    "PT",               # pytest style
+    "ANN",              # annotations
+    "LOG", "G",         # logging correctness
+    "PTH",              # pathlib
+    "RET", "ARG",
+]
+ignore = [
+    "ANN401",  # Any is occasionally correct (log kwargs, redaction walkers)
+    "S101",    # assert — re-enabled outside tests via per-file-ignores below
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "ANN", "ARG", "TID251"]
+"alembic/versions/*" = ["ANN", "E501"]
+# The one module allowed to touch stdlib logging: it installs the redaction chain onto
+# the root logger, which is what stops third-party loggers bypassing it.
+"src/personal_organizer/observability/logging.py" = ["TID251", "LOG015"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+# Layering: providers/ and db/ are lower layers and must never import the entrypoints.
+# interfaces/ must stay dependency-free so the Protocols remain swappable.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"logging.getLogger".msg = "Use structlog.get_logger() so records pass through PII redaction."
+
+[tool.ruff.lint.isort]
+known-first-party = ["personal_organizer"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+warn_unused_ignores = true
+show_error_codes = true
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["composio.*", "langfuse.*", "procrastinate.*", "asyncpg.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q --strict-markers --strict-config"
+markers = [
+    "db: requires a live PostgreSQL database",
+    "rls: row-level-security isolation suite (Iteration 03)",
+    "integration: exercises more than one service",
+    "slow: takes more than a second",
+]
+
+[tool.coverage.run]
+source = ["src/personal_organizer"]
+branch = true

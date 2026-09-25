@@ -11,6 +11,7 @@ import io
 import json
 import logging
 from collections.abc import Callable
+from uuid import uuid4
 
 import pytest
 import structlog
@@ -134,6 +135,21 @@ class TestNoPiiInLogs:
         finally:
             structlog.contextvars.clear_contextvars()
         _assert_absent(log_stream.getvalue())
+
+    async def test_correlation_ids_survive_the_real_chain(self, log_stream: io.StringIO) -> None:
+        """Bound as contextvars, exactly as RequestContextMiddleware and tenant_session
+        bind them, and asserted on the bytes the handler actually emits -- a redactor that
+        strips correlation ids passes every leak test above and still breaks every
+        investigation that starts from a request id the user was shown."""
+        request_id, tenant_id = uuid4().hex, str(uuid4())
+        structlog.contextvars.bind_contextvars(request_id=request_id, tenant_id=tenant_id)
+        try:
+            structlog.get_logger("test.pii").info("http.request", status_code=200)
+        finally:
+            structlog.contextvars.clear_contextvars()
+        record = json.loads(log_stream.getvalue().strip().splitlines()[-1])
+        assert record["request_id"] == request_id
+        assert record["tenant_id"] == tenant_id
 
     async def test_output_is_still_valid_json_with_useful_fields(
         self, log_stream: io.StringIO

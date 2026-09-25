@@ -14,7 +14,10 @@ Four layers, in order:
    identifier.
 3. **Allowlist** -- everything else is replaced.
 4. **Value scrubbing** -- applied *even to allowlisted values*, because ``event``, ``path``
-   and exception strings are allowlisted and routinely carry PII.
+   and exception strings are allowlisted and routinely carry PII. The one exception is
+   :data:`OPAQUE_ID_KEYS`: correlation ids are long alphanumeric strings, so the token rule
+   would otherwise replace every one of them with a marker and leave nothing to correlate.
+   Those keys skip text scrubbing only when the value matches an identifier shape exactly.
 
 The same :func:`scrub_text` backs the Sentry ``before_send`` hook. One scrubber, two
 consumers; wiring Sentry through a separate implementation is how the two drift apart.
@@ -156,6 +159,26 @@ SAFE_KEYS: Final = frozenset(
     }
 )
 
+#: Allowlisted keys holding system-generated opaque identifiers -- UUIDs, hex digests,
+#: release SHAs. They are allowlisted *for* correlation, but they are long and alphanumeric,
+#: so ``_LONG_TOKEN`` (and, for a digit-heavy id, ``_DIGITS_RUN``) would otherwise rewrite
+#: every one of them and correlate nothing with nothing. Values here skip text scrubbing
+#: only when they genuinely look like an identifier -- see :func:`_is_opaque_id` -- because
+#: ``request_id`` is taken from an inbound header when one is present, so an allowlisted key
+#: is not a trusted value.
+OPAQUE_ID_KEYS: Final = frozenset(
+    {
+        "request_id",
+        "trace_id",
+        "span_id",
+        "tenant_id",
+        "job_id",
+        "session_id_hash",
+        "client_ip_hash",
+        "release",
+    }
+)
+
 #: Keys that must never be allowlisted. Asserted disjoint from SAFE_KEYS in the test suite.
 FORBIDDEN_KEYS: Final = SECRET_KEYS | HASH_KEYS | CONTENT_KEYS
 
@@ -164,6 +187,10 @@ _EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _IBAN = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{8,26}\b")
 _DIGITS_RUN = re.compile(r"(?<![\w.])[+(]?\d[\d\s().-]{6,}\d\b")
 _LONG_TOKEN = re.compile(r"\b[A-Za-z0-9+/_-]{32,}={0,2}\b")
+# Opaque-identifier shapes, anchored end to end: a dashed UUID, or a bare hex digest --
+# uuid4().hex, a W3C trace or span id, a release commit SHA, a hash_identifier() digest.
+_UUID_SHAPE = re.compile(r"\A[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\Z")
+_HEX_SHAPE = re.compile(r"\A[0-9a-fA-F]{16,64}\Z")
 # Procrastinate interpolates Job.call_string -- "task_name[id](kwarg=<repr>, ...)" --
 # straight into its log messages at INFO and ERROR. Those kwargs carry user content, and
 # no content-detecting regex can save us there, so the argument list is dropped wholesale.
@@ -263,6 +290,26 @@ def _scrub_value(value: object, depth: int = 0) -> object:
     return scrub_text(str(value))
 
 
+def _is_opaque_id(value: str) -> bool:
+    """True only for values that are certainly machine-generated identifiers.
+
+    Anchored and narrow on purpose: anything that is not exactly a UUID or a hex digest
+    falls through to :func:`scrub_text` and is redacted as usual, so a caller who puts a
+    phone number in ``X-Request-ID`` gains nothing. All-digit values are excluded because a
+    numeric run of this length is a phone or card number, not an identifier.
+    """
+    if value.isdigit():
+        return False
+    return bool(_UUID_SHAPE.match(value) or _HEX_SHAPE.match(value))
+
+
+def _scrub_allowlisted(key: str, value: object) -> object:
+    """Scrub a value whose key is on the allowlist, keeping correlation ids intact."""
+    if key in OPAQUE_ID_KEYS and isinstance(value, str) and _is_opaque_id(value):
+        return value
+    return _scrub_value(value)
+
+
 def redact_event(
     event_dict: dict[str, Any], *, pepper: str, allow_raw: bool = False
 ) -> dict[str, Any]:
@@ -282,7 +329,7 @@ def redact_event(
         elif key in HASH_KEYS:
             out[f"{raw_key}_hash"] = hash_identifier(value, pepper)
         elif key in SAFE_KEYS:
-            out[str(raw_key)] = _scrub_value(value)
+            out[str(raw_key)] = _scrub_allowlisted(key, value)
         else:
             out[str(raw_key)] = _shape(value)
     return out
@@ -302,6 +349,7 @@ __all__ = [
     "FORBIDDEN_KEYS",
     "HASH_KEYS",
     "MAX_STR",
+    "OPAQUE_ID_KEYS",
     "SAFE_KEYS",
     "SECRET_KEYS",
     "Unredacted",

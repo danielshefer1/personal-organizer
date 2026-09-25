@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -14,6 +15,7 @@ from personal_organizer.observability.redaction import (
     CONTENT_KEYS,
     FORBIDDEN_KEYS,
     MAX_STR,
+    OPAQUE_ID_KEYS,
     SAFE_KEYS,
     SECRET_KEYS,
     Unredacted,
@@ -83,6 +85,51 @@ class TestPositionalMatrix:
     @pytest.mark.parametrize("value", PATTERN_PII + CONTENT_PII)
     def test_pii_in_nested_content_key(self, value: str) -> None:
         assert value not in _render({"exception": {"body": value}})
+
+
+class TestCorrelationIdsSurvive:
+    """The other half of the contract.
+
+    ``request_id`` is allowlisted so a user's report can be tied to a log line, and
+    ``tenant_id`` so a tenant's activity can be followed. Both are long alphanumeric
+    strings, so the token and digit-run rules in scrub_text will rewrite them unless
+    they are recognised as identifiers -- and a correlation id that never survives to
+    stdout correlates nothing with nothing.
+    """
+
+    def test_opaque_keys_are_allowlisted(self) -> None:
+        """A key that is not in SAFE_KEYS is shaped before it ever reaches the scrubber."""
+        assert OPAQUE_ID_KEYS <= SAFE_KEYS
+
+    def test_opaque_keys_are_never_forbidden(self) -> None:
+        assert OPAQUE_ID_KEYS.isdisjoint(FORBIDDEN_KEYS)
+
+    @pytest.mark.parametrize("key", sorted(OPAQUE_ID_KEYS))
+    def test_uuid_hex_survives_under_every_opaque_key(self, key: str) -> None:
+        value = uuid4().hex
+        assert redact_event({key: value}, pepper="pepper")[key] == value
+
+    def test_dashed_uuid_survives(self) -> None:
+        value = str(uuid4())
+        assert redact_event({"tenant_id": value}, pepper="pepper")["tenant_id"] == value
+
+    def test_release_sha_survives(self) -> None:
+        value = "9f2c1d4b" * 5  # 40 hex chars, as RAILWAY_GIT_COMMIT_SHA supplies
+        assert redact_event({"release": value}, pepper="pepper")["release"] == value
+
+    def test_digit_heavy_id_survives(self) -> None:
+        """A hex id ending in a long digit run would otherwise trip the phone rule."""
+        value = "ab" * 12 + "12345678"
+        assert redact_event({"request_id": value}, pepper="pepper")["request_id"] == value
+
+    @pytest.mark.parametrize("value", PATTERN_PII)
+    def test_client_supplied_correlation_ids_are_still_scrubbed(self, value: str) -> None:
+        """An allowlisted key is not a trusted value: request_id is taken from an inbound
+        X-Request-ID header whenever the caller sends one."""
+        assert value not in _render({"request_id": value})
+
+    def test_all_digit_values_are_not_mistaken_for_identifiers(self) -> None:
+        assert "0031612345678" not in _render({"request_id": "0031612345678"})
 
 
 class TestSecrets:

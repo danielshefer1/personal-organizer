@@ -44,7 +44,9 @@ uv run po-worker
 Then prove the skeleton end to end — api, database, queue, worker:
 
 ```sh
-curl -X POST localhost:8000/internal/ping    # worker logs {"event": "ping.ok", ...}
+# The token is APP__INTERNAL_TOKEN from .env. /internal answers 404 without it.
+curl -X POST -H "X-Internal-Token: local-dev-internal-token" \
+  localhost:8000/internal/ping               # worker logs {"event": "ping.ok", ...}
 ```
 
 ### The local database holds nothing real
@@ -75,3 +77,8 @@ every task kwarg into its own log messages. See `docs/adr/0001`.
 Railway, EU West (`europe-west4-drams3a`), two environments. `main` deploys to staging; the
 `production` branch deploys to production. Migrations run as a pre-deploy command, never at
 app startup. Service config lives in `railway.api.json` and `railway.worker.json`.
+
+Setting an environment up the first time — every variable, and the three ways it bites if you
+miss one — is `docs/runbook-iteration-01.md`. The short version: a deployed service **refuses to
+boot** without `SENTRY__DSN`, a real `LOGGING__PII_PEPPER`, `DATABASE__OWNER_URL`, and (in
+staging only) `APP__INTERNAL_TOKEN`, so the Sentry project has to exist before the first deploy.

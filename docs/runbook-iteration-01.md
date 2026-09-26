@@ -51,7 +51,31 @@ Environments `staging` and `production`. In each:
 Pin the Postgres tag explicitly. Default provisioning may hand over a newer major, and the
 vendored Procrastinate schema and pgvector floor are checked against 16.
 
-Set each service's config-as-code path in its settings, then:
+**Set each service's config-as-code path in its settings — this is mandatory, not tidiness.**
+Railway auto-detects only `railway.json` / `railway.toml` at the repo root. A custom filename
+must be selected per service, in the dashboard: Settings → Config-as-code path
+(`railway.api.json` for the api, `railway.worker.json` for the worker). There is no environment
+variable for it and the CLI does not expose it, so it is a manual step per service per
+environment.
+
+Until it is set, **both files are inert** and the failure is indirect rather than obvious:
+
+- No `preDeployCommand`, so `po-db bootstrap` and `alembic upgrade head` never run. `app_owner`
+  and `app_user` are never created, and the api dies in its lifespan on
+  `password authentication failed for user "app_user"` — which is what PostgreSQL says for a role
+  that *does not exist*, since it deliberately does not distinguish the two. It reads like a
+  wrong password and is not one.
+- No `startCommand`, so the worker runs the Dockerfile's `CMD` — uvicorn. You get two api
+  containers and an empty queue, with nothing in the logs to say so.
+- No `healthcheckPath`, so Railway reports a deploy as SUCCESS on process start. A crash-looping
+  service can therefore show green; check the deploy logs, not the badge.
+
+A single root `railway.json` shared by both services does not solve this: `startCommand` and
+`preDeployCommand` could dispatch on `APP__COMPONENT`, but `healthcheckPath` is static and would
+be applied to the worker too, which serves no HTTP and would fail it. Per-service paths are the
+only correct shape.
+
+Then:
 
 - Enable **Wait for CI** on the staging services. This is what reconciles "deploys on merge"
   with "CI gates the merge", and it does it without putting a deploy token in GitHub.
@@ -105,11 +129,13 @@ it unreachable when deployed.
 
 ### Three traps worth reading twice
 
-1. **`APP__RELEASE` is not wired automatically.** `settings.py` documents it as coming from
-   `RAILWAY_GIT_COMMIT_SHA`, but nothing in the code reads that variable and neither
-   `railway.*.json` maps it. Without the explicit `${{RAILWAY_GIT_COMMIT_SHA}}` reference above,
-   `/health` and every Sentry issue report `release: "dev"`, and you lose the ability to say
-   which commit an error came from. Configuration fix, not a code fix.
+1. **`APP__RELEASE` is not wired automatically, and the obvious fix does not work either.**
+   `settings.py` documents it as coming from `RAILWAY_GIT_COMMIT_SHA`, but nothing in the code
+   reads that variable and neither `railway.*.json` maps it. Setting
+   `APP__RELEASE=${{RAILWAY_GIT_COMMIT_SHA}}` was tried and **resolves to an empty string** — and
+   empty is worse than absent, because `""` overrides the `"dev"` default rather than falling back
+   to it. Check `/health` after any change here; if `release` is blank or `dev`, Sentry cannot tell
+   you which commit an error came from. Unresolved; treat it as open.
 2. **`APP__INTERNAL_TOKEN` is required in staging, not in production.** `/internal/ping` is
    mounted whenever `APP__ENV != "production"`, so staging serves it on a public URL where it
    enqueues a job and hits the database per call. It is gated on an `X-Internal-Token` header,
@@ -118,6 +144,32 @@ it unreachable when deployed.
 3. **`DATABASE__BOOTSTRAP_URL` is only needed by the pre-deploy command**, but it *is* needed:
    `railway.api.json` runs `po-db bootstrap && alembic upgrade head` before every deploy, and
    bootstrap is the only tier that may `CREATE EXTENSION` and `CREATE ROLE`.
+4. **`railway add -d postgres` provisions the wrong thing.** It ignores both the project region
+   and any version pin, giving the latest major in Railway's default US region — observed as
+   `postgres-ssl:18` in `sfo`, with the 500 MB volume there too. Both matter: PG18 is a different
+   major from the PG16 that `docker-compose.yml` and CI run, and a US volume puts EU personal data
+   in the wrong jurisdiction. Fix the image and *both* regions (service and volume) in the
+   dashboard before bootstrapping, or create the database there in the first place. `railway
+   service scale` moves a stateless service between regions but **adds** a replica rather than
+   moving it — pass the old region explicitly at zero, e.g.
+   `railway service scale --service worker europe-west4-drams3a=1 sfo=0`.
+
+### What the CLI can and cannot do
+
+Useful when scripting this. Variables work non-interactively; deploy settings do not.
+
+| Task | CLI |
+|---|---|
+| Set variables | `railway variables --service S --environment E --skip-deploys --set 'K=V'` — works |
+| Create a service from the repo | `railway add -s NAME -r owner/repo --branch main` — works, prompts but honours the flags |
+| Region of a stateless service | `railway service scale` — works, see the caveat above |
+| Duplicate an environment | `railway environment new staging --duplicate production` — works |
+| Start command, healthcheck, pre-deploy | `railway environment edit --service-config` — **silently no-ops** non-interactively |
+| Config-as-code path | not exposed at all — dashboard only |
+| Postgres image / volume region | not exposed at all — dashboard only |
+
+Redirect stdin from `/dev/null`; several subcommands open a prompt and then proceed with the
+flags they were given.
 
 ---
 

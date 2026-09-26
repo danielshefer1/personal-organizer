@@ -39,6 +39,41 @@ jobs:
       - run: uv sync --all-groups
       - run: uv run mypy
 
+  # Nothing built this image until it failed on Railway, twice over: a `.dockerignore` that
+  # excluded the README `pyproject.toml` declares, and cache mounts Railway's builder rejects.
+  # Only the first of those is a Docker error, so this job would have caught one of the two --
+  # a Railway-specific validator rule cannot be reproduced here. Worth having anyway: this is
+  # the same image production runs, and every other job tests the source instead.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: personal-organizer:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # A building image that cannot start is the next failure along. These are exactly the
+      # entrypoints railway.api.json and railway.worker.json invoke, plus the SQL file
+      # `po-db bootstrap` resolves by walking out of site-packages -- which is packaged by
+      # `COPY . .` rather than declared as package data, so only a real image proves it.
+      - name: Smoke-test the entrypoints
+        run: |
+          docker run --rm personal-organizer:ci python -c '
+          import shutil, pathlib
+          import personal_organizer.api.app, personal_organizer.worker.main, personal_organizer.db.cli
+          from personal_organizer.db.bootstrap import BOOTSTRAP_SQL
+          for script in ("po-db", "po-worker", "uvicorn", "alembic"):
+              assert shutil.which(script), f"{script} is not on PATH"
+          assert BOOTSTRAP_SQL.exists(), f"{BOOTSTRAP_SQL} is missing from the image"
+          assert pathlib.Path("/app/alembic/vendor/procrastinate_3.10.sql").exists()
+          print("image smoke test ok")
+          '
+
   test:
     runs-on: ubuntu-latest
     services:

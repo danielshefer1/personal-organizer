@@ -10,14 +10,26 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
+# NO BuildKit cache mounts here, and they cannot be added back. Railway's builder rejects a
+# bare `--mount=type=cache`: the id must be `s/<service id>-<target>`, hardcoded, because the
+# flag does not expand build args or environment variables -- and the validator requires the
+# prefix to match the id of the service *currently deploying*.
+#
+# `api` and `worker` both build from this one file (railway.api.json, railway.worker.json), so
+# any single hardcoded id satisfies exactly one of them and fails the other identically. Per
+# Railway support, a Dockerfile shared by several services cannot use cache mounts at all.
+#
+# The cost is small. The layer below is still Docker-layer-cached on pyproject.toml + uv.lock,
+# so dependencies are only re-downloaded when the lockfile actually changes -- which is the
+# one case a cache mount would have helped. Splitting this into two near-identical Dockerfiles
+# to win that back would be a worse trade than the download.
+
 # Dependencies first, so a source-only change does not re-resolve the whole lockfile.
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+RUN uv sync --frozen --no-install-project --no-dev
 
 COPY . .
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev
 
 
 FROM python:3.14-slim-bookworm AS runtime

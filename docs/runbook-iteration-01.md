@@ -44,36 +44,60 @@ Environments `staging` and `production`. In each:
 
 | Service | Config as code | Watches |
 |---|---|---|
-| `api` | `railway.api.json` | `main` (staging) / `production` (production) |
-| `worker` | `railway.worker.json` | same |
+| `api` | dashboard: pre-deploy + healthcheck (below) | `main` (staging) / `production` (production) |
+| `worker` | none — the image's CMD dispatches | same |
 | Postgres | — | pin the image to `postgres-ssl:16` |
 
 Pin the Postgres tag explicitly. Default provisioning may hand over a newer major, and the
 vendored Procrastinate schema and pgvector floor are checked against 16.
 
-**Set each service's config-as-code path in its settings — this is mandatory, not tidiness.**
-Railway auto-detects only `railway.json` / `railway.toml` at the repo root. A custom filename
-must be selected per service, in the dashboard: Settings → Config-as-code path
-(`railway.api.json` for the api, `railway.worker.json` for the worker). There is no environment
-variable for it and the CLI does not expose it, so it is a manual step per service per
-environment.
+### Config as Code is dead — do not plan around it
 
-Until it is set, **both files are inert** and the failure is indirect rather than obvious:
+The original plan called for `railway.api.json` and `railway.worker.json`, one per service. Both
+files have been **deleted**, because they cannot work. Railway says:
+
+> Config as Code is deprecated. Prefer Infrastructure as Code. Existing config files keep working
+> until 2026-12-01. Starting 2026-08-28, services that have never used Config as Code cannot opt
+> in.
+
+Every service here was created after that cutoff and never used the mechanism, so it cannot be
+enabled for them. Setting the path in the dashboard is accepted by the form and then **silently
+ignored** — no error, and the only symptom is that none of the config applies.
+
+The replacement, Infrastructure as Code (`.railway/railway.ts` + `railway config plan|apply`),
+needs the Railway TypeScript SDK from npm — a Node toolchain and a `node_modules` in a uv
+project. Worth revisiting if this grows; not worth it for two services.
+
+So deployment config now comes from two places.
+
+**In the image — the start command.** The `CMD` dispatches on `APP__COMPONENT`, which already
+exists to say which component a process is. `exec`, so the process is PID 1 and receives SIGTERM
+rather than the shell swallowing it; and `${PORT:-8000}`, so Railway's assigned port is honoured
+without breaking a local `docker run -p 8000:8000`. The `docker` CI job asserts both roles,
+because a mistake here silently turns the worker into a second api: both start, both look
+healthy, and the queue is never drained.
+
+**In the dashboard — the two things an image cannot express.** On the **api** service only:
+
+| Setting | Value |
+|---|---|
+| Pre-deploy command | `po-db bootstrap && alembic upgrade head` |
+| Healthcheck path | `/health` |
+
+Per service, per environment. The worker gets neither: no pre-deploy, because two services racing
+`alembic upgrade head` is a real failure mode; no healthcheck, because it serves no HTTP and one
+would fail it.
+
+Both failures are indirect, so know the symptoms:
 
 - No `preDeployCommand`, so `po-db bootstrap` and `alembic upgrade head` never run. `app_owner`
   and `app_user` are never created, and the api dies in its lifespan on
   `password authentication failed for user "app_user"` — which is what PostgreSQL says for a role
   that *does not exist*, since it deliberately does not distinguish the two. It reads like a
   wrong password and is not one.
-- No `startCommand`, so the worker runs the Dockerfile's `CMD` — uvicorn. You get two api
-  containers and an empty queue, with nothing in the logs to say so.
-- No `healthcheckPath`, so Railway reports a deploy as SUCCESS on process start. A crash-looping
-  service can therefore show green; check the deploy logs, not the badge.
-
-A single root `railway.json` shared by both services does not solve this: `startCommand` and
-`preDeployCommand` could dispatch on `APP__COMPONENT`, but `healthcheckPath` is static and would
-be applied to the worker too, which serves no HTTP and would fail it. Per-service paths are the
-only correct shape.
+- No healthcheck path, so Railway reports a deploy as SUCCESS on process start. A crash-looping
+  service therefore shows green — this happened twice while setting staging up. Read the deploy
+  logs, not the badge.
 
 Then:
 
@@ -82,10 +106,9 @@ Then:
 - Create the `production` branch — it does not exist yet — and point production's services at
   it. Promotion is a fast-forward from `main`, never a separate build.
 
-The worker deliberately has **no** `preDeployCommand`: two services racing
-`alembic upgrade head` is a real failure mode. The trade-off is that the worker can briefly
-start against the old schema; it is the same commit and `restartPolicyType: ALWAYS` recovers.
-If that ever bites, the fix is a dedicated migrate service, not a second pre-deploy hook.
+The trade-off of keeping migrations off the worker is that it can briefly start against the old
+schema. Same commit, and a restart recovers. If that ever bites, the fix is a dedicated migrate
+service, not a second pre-deploy hook.
 
 ---
 
@@ -101,19 +124,21 @@ through transaction-local GUCs so the password never appears in a statement stri
 (`alembic/bootstrap.sql`). So you embed the generated passwords in the owner and app URLs, and
 bootstrap makes the cluster match.
 
-Use `RAILWAY_PRIVATE_DOMAIN` — the internal network, which costs no egress. `sslmode=disable`
-is correct there, and `db/dsn.py` handles the scheme and driver rewriting either way.
+Assemble the DSNs from the Postgres service's own variables rather than its `DATABASE_URL`:
+the owner and app URLs need `app_owner`/`app_user` credentials, not the superuser's. `PGHOST`
+is the internal private-network host, so this costs no egress, and `db/dsn.py` handles the
+scheme and driver rewriting. Verified resolving to `postgres.railway.internal:5432/railway`.
 
 | Variable | Value |
 |---|---|
 | `APP__ENV` | `staging` / `production` |
 | `APP__COMPONENT` | `api` on the api service, `worker` on the worker |
-| `APP__RELEASE` | `${{RAILWAY_GIT_COMMIT_SHA}}` — **see the trap below** |
+| `APP__RELEASE` | **unresolved** — the obvious reference yields `""`; see the trap below |
 | `APP__DEBUG` | `false` |
 | `APP__INTERNAL_TOKEN` | generated secret — **required in staging** |
-| `DATABASE__BOOTSTRAP_URL` | the Postgres service's superuser DSN over the private domain |
-| `DATABASE__OWNER_URL` | `postgresql://app_owner:<generated>@${{Postgres.RAILWAY_PRIVATE_DOMAIN}}:5432/railway` |
-| `DATABASE__APP_URL` | `postgresql://app_user:<generated>@${{Postgres.RAILWAY_PRIVATE_DOMAIN}}:5432/railway` |
+| `DATABASE__BOOTSTRAP_URL` | `postgresql://${{Postgres.PGUSER}}:${{Postgres.PGPASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}` |
+| `DATABASE__OWNER_URL` | `postgresql://app_owner:<generated>@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}` |
+| `DATABASE__APP_URL` | `postgresql://app_user:<generated>@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}` |
 | `LOGGING__RENDERER` | `json` — anything else is rejected when deployed |
 | `LOGGING__PII_PEPPER` | generated secret, different per environment |
 | `SENTRY__DSN` | from step 0 — **required** |
@@ -142,7 +167,8 @@ it unreachable when deployed.
    and a staging service with no token set refuses to boot. Production does not mount the router
    at all, so it needs no token.
 3. **`DATABASE__BOOTSTRAP_URL` is only needed by the pre-deploy command**, but it *is* needed:
-   `railway.api.json` runs `po-db bootstrap && alembic upgrade head` before every deploy, and
+   the api's pre-deploy command runs `po-db bootstrap && alembic upgrade head` before every
+   deploy, and
    bootstrap is the only tier that may `CREATE EXTENSION` and `CREATE ROLE`.
 4. **`railway add -d postgres` provisions the wrong thing.** It ignores both the project region
    and any version pin, giving the latest major in Railway's default US region — observed as
@@ -236,7 +262,7 @@ as a failed healthcheck and a rollback:
 
 ## What is deliberately not in this iteration
 
-`/ready` is **not** the platform healthcheck, and that is on purpose. `railway.api.json` points
-the healthcheck at `/health`, which does no I/O. Gating deploys on `/ready` would let a
+`/ready` is **not** the platform healthcheck, and that is on purpose. The api's healthcheck path
+is `/health`, which does no I/O. Gating deploys on `/ready` would let a
 five-second Postgres blip during a routine restart roll back a good deploy, or kill a running
 one. Monitoring should see that blip; the deployment pipeline should not react to it.

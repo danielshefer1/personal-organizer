@@ -8,6 +8,10 @@ htmlcov
 docs
 tests
 *.md
+# pyproject.toml declares `readme = "README.md"`, and uv_build reads it when it installs the
+# project itself -- so excluding it fails the build with "failed to open file /app/README.md".
+# `docs` is already excluded above, so this exception pulls in nothing else.
+!README.md
 .env
 .env.*
 !.env.example

@@ -40,3 +40,9 @@ class TestQueues:
 
     def test_default_subscriptions_exclude_the_agent_queue(self, settings: Settings) -> None:
         assert Queue.AGENT.value not in settings.worker.queues
+
+    def test_default_subscriptions_include_the_queue_ping_runs_on(self, settings: Settings) -> None:
+        """Dropping `maintenance` from WORKER__QUEUES breaks the walking-skeleton proof
+        silently: the api still returns 200 {"deferred": true} and no worker ever runs it."""
+        app = build_procrastinate_app(settings)
+        assert app.tasks[PING_TASK].queue in settings.worker.queues

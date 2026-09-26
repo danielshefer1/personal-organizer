@@ -35,6 +35,10 @@ def create_app(settings: Settings) -> FastAPI:
         openapi_url=None if settings.is_deployed else "/openapi.json",
     )
 
+    # Request-scoped rather than the lru_cached global, so /health reports the env and release
+    # this app was actually constructed with. See personal_organizer.api.deps.
+    app.state.settings = settings
+
     # NOTE: do not add GZipMiddleware or anything else that rewrites request bodies above
     # the webhook router -- Iteration 02 verifies an HMAC over the exact received bytes.
     app.add_middleware(RequestContextMiddleware)

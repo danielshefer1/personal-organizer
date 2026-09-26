@@ -30,8 +30,14 @@ _DEV_PEPPER = "local-dev-pepper-not-secret"
 class AppSettings(BaseModel):
     env: Environment = "local"
     component: Component = "api"
-    release: str = "dev"  # set from RAILWAY_GIT_COMMIT_SHA
+    #: Set from ``RAILWAY_GIT_COMMIT_SHA``. Nothing reads that variable automatically, so the
+    #: Railway services map it explicitly -- see ``docs/runbook-iteration-01.md``. Left unset it
+    #: reports "dev", which makes every Sentry release indistinguishable.
+    release: str = "dev"
     debug: bool = False
+    #: Shared secret for the ``/internal`` router. That router is mounted whenever ``env`` is not
+    #: ``production``, so on staging it is publicly reachable and enqueues work per call.
+    internal_token: SecretStr | None = None
 
 
 class DatabaseSettings(BaseModel):
@@ -149,6 +155,10 @@ class Settings(BaseSettings):
             problems.append("LOGGING__PII_PEPPER must be set to a real secret when deployed")
         if self.database.owner_url is None:
             problems.append("DATABASE__OWNER_URL is required when deployed (Alembic)")
+        # The /internal router is mounted whenever env != "production", so staging serves it on a
+        # public URL. Refusing to boot without a token is what keeps it from being open.
+        if self.app.env == "staging" and self.app.internal_token is None:
+            problems.append("APP__INTERNAL_TOKEN is required in staging (/internal is mounted)")
         if problems:
             msg = "Invalid settings for a deployed environment: " + "; ".join(problems)
             raise ValueError(msg)

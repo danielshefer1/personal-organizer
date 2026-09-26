@@ -75,6 +75,25 @@ class TestDeployedInvariants:
         with pytest.raises(ValidationError, match="SENTRY__DSN"):
             settings_factory(APP__ENV="production")
 
+    def test_staging_without_an_internal_token_is_rejected(self, settings_factory: Any) -> None:
+        """The /internal router is mounted whenever env != production, so staging serves it on
+        a public URL. Refusing to boot is what keeps it from being open there."""
+        with pytest.raises(ValidationError, match="APP__INTERNAL_TOKEN"):
+            settings_factory(
+                APP__ENV="staging",
+                SENTRY__DSN="https://k@o.ingest.sentry.io/1",
+                LOGGING__PII_PEPPER="a-real-secret",
+            )
+
+    def test_production_needs_no_internal_token(self, settings_factory: Any) -> None:
+        """Because the router is not mounted there at all."""
+        cfg = settings_factory(
+            APP__ENV="production",
+            SENTRY__DSN="https://k@o.ingest.sentry.io/1",
+            LOGGING__PII_PEPPER="a-real-secret",
+        )
+        assert cfg.app.internal_token is None
+
     def test_valid_production_config_boots(self, settings_factory: Any) -> None:
         cfg = settings_factory(
             APP__ENV="production",

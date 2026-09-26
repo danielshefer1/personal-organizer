@@ -76,7 +76,12 @@ every task kwarg into its own log messages. See `docs/adr/0001`.
 
 Railway, EU West (`europe-west4-drams3a`), two environments. `main` deploys to staging; the
 `production` branch deploys to production. Migrations run as a pre-deploy command, never at
-app startup. Service config lives in `railway.api.json` and `railway.worker.json`.
+app startup.
+
+There are no `railway.*.json` files: Railway's Config as Code is deprecated and cannot be
+enabled for a service created after 2026-08-28, so the start command lives in the Dockerfile
+`CMD` (dispatching on `APP__COMPONENT`) and the api's pre-deploy command and healthcheck path
+are set per service in the dashboard.
 
 Setting an environment up the first time — every variable, and the three ways it bites if you
 miss one — is `docs/runbook-iteration-01.md`. The short version: a deployed service **refuses to

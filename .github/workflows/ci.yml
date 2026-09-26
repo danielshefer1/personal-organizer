@@ -58,7 +58,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       # A building image that cannot start is the next failure along. These are exactly the
-      # entrypoints railway.api.json and railway.worker.json invoke, plus the SQL file
+      # entrypoints the deployed services invoke, plus the SQL file
       # `po-db bootstrap` resolves by walking out of site-packages -- which is packaged by
       # `COPY . .` rather than declared as package data, so only a real image proves it.
       - name: Smoke-test the entrypoints
@@ -73,6 +73,41 @@ jobs:
           assert pathlib.Path("/app/alembic/vendor/procrastinate_3.10.sql").exists()
           print("image smoke test ok")
           '
+      # The CMD dispatches on APP__COMPONENT, so a typo there silently turns the worker into a
+      # second api: both start, both look healthy, and the queue is never drained. Asserted by
+      # which entrypoint each role reaches before it fails on the absent database.
+      - name: The CMD dispatches api and worker correctly
+        run: |
+          # Both roles fail on the absent database; what is asserted is which entrypoint each
+          # one reached first. `if` rather than `&&`, because this shell runs with errexit and a
+          # deliberately-failing grep would otherwise abort the step.
+          settings=(
+            -e DATABASE__APP_URL=postgresql://u:p@nonexistent-host:5432/db
+            -e MODELS__CHAT_MODEL=m -e MODELS__FALLBACK_MODEL=m
+            -e MODELS__EMBEDDING_MODEL=m -e MODELS__TRANSCRIPTION_MODEL=m
+          )
+
+          worker_out="$(docker run --rm -e APP__COMPONENT=worker "${settings[@]}" \
+            personal-organizer:ci 2>&1 || true)"
+          if ! grep -q 'bin/po-worker' <<<"$worker_out"; then
+            echo "::error::worker role did not start po-worker"
+            tail -20 <<<"$worker_out"
+            exit 1
+          fi
+
+          api_out="$(docker run --rm -e APP__COMPONENT=api -e PORT=9123 "${settings[@]}" \
+            personal-organizer:ci 2>&1 || true)"
+          if ! grep -q 'Started server process' <<<"$api_out"; then
+            echo "::error::api role did not start uvicorn"
+            tail -20 <<<"$api_out"
+            exit 1
+          fi
+          if grep -q 'bin/po-worker' <<<"$api_out"; then
+            echo "::error::api role started the worker instead"
+            exit 1
+          fi
+
+          echo "CMD dispatch ok"
 
   test:
     runs-on: ubuntu-latest

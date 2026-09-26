@@ -47,4 +47,15 @@ COPY --from=builder --chown=app:app /app /app
 
 USER app
 
-CMD ["uvicorn", "personal_organizer.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+# One image, two roles, dispatched on APP__COMPONENT -- the setting that already exists to say
+# which component a process is. This lives here rather than in a platform start command because
+# Railway's Config-as-Code is deprecated (existing files work until 2026-12-01, and a service
+# that never used it cannot opt in after 2026-08-28), and its replacement, Infrastructure as
+# Code, needs an npm SDK this Python repo has no reason to carry. The remaining choice was
+# "start command in the image" or "start command typed into a dashboard"; only one of those is
+# reviewable and survives recreating a service.
+#
+# $PORT because Railway assigns it; the fallback keeps `docker run -p 8000:8000` working locally.
+# `exec` so the process replaces the shell and receives SIGTERM -- without it the shell swallows
+# the signal and both services lose their graceful drain (15s api, 40s worker).
+CMD ["sh", "-c", "if [ \"$APP__COMPONENT\" = worker ]; then exec po-worker; else exec uvicorn personal_organizer.api.main:app --host 0.0.0.0 --port \"${PORT:-8000}\" --no-access-log; fi"]

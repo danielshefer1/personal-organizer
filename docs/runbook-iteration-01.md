@@ -109,8 +109,9 @@ Then:
 
 - Enable **Wait for CI** on the staging services. This is what reconciles "deploys on merge"
   with "CI gates the merge", and it does it without putting a deploy token in GitHub.
-- Create the `production` branch — it does not exist yet — and point production's services at
-  it. Promotion is a fast-forward from `main`, never a separate build.
+- Point production's services at the `production` branch. The first `scripts/promote` creates
+  it, and every promotion after that fast-forwards it onto a green commit of `main` — see
+  `docs/promotion.md`. There is never a separate production build.
 
 The trade-off of keeping migrations off the worker is that it can briefly start against the old
 schema. Same commit, and a restart recovers. If that ever bites, the fix is a dedicated migrate
@@ -219,11 +220,11 @@ flags they were given.
 gh auth login
 ```
 
-Then branch protection on `main`: require the `lint`, `types` and `test` checks, require a pull
-request, disallow force-pushes.
+Branch rulesets on `main` and `production` are applied — what they require, and why
+`production` deliberately does *not* require a pull request, is `docs/promotion.md`.
 
-**Do this after the first CI run has gone green**, not before. A required check that has never
-passed blocks the very merge that would make it pass.
+**Apply a required check only after it has gone green once**, never before. A required check
+that has never passed blocks the very merge that would make it pass.
 
 ---
 

@@ -15,6 +15,7 @@ skeleton)** is what currently exists.
 | `src/personal_organizer/interfaces/` | `LLMProvider`, `CalendarProvider`, `MemoryStore`, `Channel`, `TasksProvider`, `ExportService`. |
 | `alembic/` | Migrations, `bootstrap.sql`, vendored Procrastinate schema. |
 | `docs/adr/` | Decisions that are not obvious from the code. |
+| `scripts/promote` | Fast-forwards `production` onto a green commit of `main`. |
 
 ## Getting started
 
@@ -77,6 +78,10 @@ every task kwarg into its own log messages. See `docs/adr/0001`.
 Railway, EU West (`europe-west4-drams3a`), two environments. `main` deploys to staging; the
 `production` branch deploys to production. Migrations run as a pre-deploy command, never at
 app startup.
+
+`production` is a pointer into `main`, moved forward by `scripts/promote` — never a parallel
+line of development, and never moved backwards. `docs/promotion.md` is the model, the rules the
+branch rulesets enforce, and what to do instead of a rollback.
 
 There are no `railway.*.json` files: Railway's Config as Code is deprecated and cannot be
 enabled for a service created after 2026-08-28, so the start command lives in the Dockerfile

@@ -8,7 +8,7 @@ that regression is caught here rather than there.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 
 from fastapi import APIRouter, FastAPI, Request
 from httpx import AsyncClient
@@ -67,3 +67,54 @@ class TestRawBody:
                 },
             )
         assert response.status_code == 413
+
+
+class TestTheSizeLimitCannotBeOptedOutOf:
+    """A declared-size check alone is a limit the sender chooses to be bound by."""
+
+    async def test_a_chunked_body_with_no_content_length_is_still_capped(
+        self, make_client: Callable[[FastAPI], AsyncClient]
+    ) -> None:
+        """No ``Content-Length`` at all, so only a cap applied while reading catches this."""
+
+        async def oversized() -> AsyncIterator[bytes]:
+            chunk = b"x" * 128 * 1024
+            for _ in range(16):  # 2 MiB, against a 1 MiB cap
+                yield chunk
+
+        async with make_client(_app_with_raw_route()) as client:
+            response = await client.post(
+                "/echo", content=oversized(), headers={"content-type": "application/json"}
+            )
+        assert response.status_code == 413
+
+    async def test_a_small_chunked_body_is_served_normally(
+        self, make_client: Callable[[FastAPI], AsyncClient]
+    ) -> None:
+        """The control for the test above: chunked is not rejected for being chunked, and the
+        reassembled bytes are still identical across the chunk boundary."""
+
+        async def in_two_pieces() -> AsyncIterator[bytes]:
+            yield NON_CANONICAL[:10]
+            yield NON_CANONICAL[10:]
+
+        async with make_client(_app_with_raw_route()) as client:
+            response = await client.post(
+                "/echo", content=in_two_pieces(), headers={"content-type": "application/json"}
+            )
+        assert response.status_code == 200
+        assert response.json()["raw"].encode() == NON_CANONICAL
+
+    async def test_a_malformed_content_length_does_not_500(
+        self, make_client: Callable[[FastAPI], AsyncClient]
+    ) -> None:
+        """``int("banana")`` used to raise straight out of the route handler. A garbled header
+        is the HTTP layer's problem; the body is small, so it is served normally."""
+        async with make_client(_app_with_raw_route()) as client:
+            response = await client.post(
+                "/echo",
+                content=NON_CANONICAL,
+                headers={"content-type": "application/json", "content-length": "banana"},
+            )
+        assert response.status_code == 200
+        assert response.json()["raw"].encode() == NON_CANONICAL

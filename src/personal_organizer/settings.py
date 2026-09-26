@@ -7,10 +7,16 @@ The important design choice here is ``_enforce_deployed_invariants``: in staging
 production the settings *tighten*, and a service that is misconfigured in a way that could
 leak PII refuses to boot. Railway's healthcheck then fails the deploy and rolls back, which
 is far better than a service that comes up happily and writes phone numbers to stdout.
+
+Which puts all of the weight on ``APP__ENV``, and it used to default to ``"local"`` in
+silence. Omitting one variable therefore disabled every check at once rather than tripping
+any of them -- so the gate is now guarded by :func:`_on_platform`, which asks the platform
+instead of asking the operator.
 """
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Literal
 
@@ -25,6 +31,14 @@ Component = Literal["api", "worker", "cli"]
 
 #: Placeholder pepper; rejected by the validator outside local/ci.
 _DEV_PEPPER = "local-dev-pepper-not-secret"
+
+#: Railway injects its own variables into every container it runs. Their presence is proof
+#: of being deployed that does not depend on anyone remembering to say so.
+_PLATFORM_PREFIX = "RAILWAY_"
+
+
+def _on_platform() -> bool:
+    return any(name.startswith(_PLATFORM_PREFIX) for name in os.environ)
 
 
 class AppSettings(BaseModel):
@@ -146,6 +160,21 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _enforce_deployed_invariants(self) -> Settings:
         if not self.is_deployed:
+            if _on_platform():
+                # Every check below is gated on APP__ENV, which defaults to "local" -- so
+                # forgetting it does not mislabel one environment, it silently switches off
+                # all of them at once. Observed in production on 2026-09-26: the pepper was
+                # allowed to stay at its public placeholder, SENTRY__DSN and
+                # DATABASE__OWNER_URL stopped being required (the missing owner URL then
+                # surfaced as an obscure failure inside the pre-deploy command instead of a
+                # named one at startup), and /internal mounted itself on a public URL with
+                # its token check disabled, because that check also defers to is_deployed.
+                msg = (
+                    f"APP__ENV is {self.app.env!r} on a container the platform is running. "
+                    "Set it to 'staging' or 'production': every deployed-environment check "
+                    "is gated on it, so an unset value disables all of them together."
+                )
+                raise ValueError(msg)
             return self
         problems: list[str] = []
         if self.logging.allow_raw_pii:

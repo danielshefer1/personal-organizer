@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --all-groups
+      - run: uv run ruff check --output-format=github .
+      - run: uv run ruff format --check .
+      # Catches pyproject.toml edited without re-locking, which otherwise fails the
+      # Railway build (uv sync --frozen) long after the PR is merged.
+      - run: uv lock --check
+
+  types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --all-groups
+      - run: uv run mypy
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP__ENV: ci
+      DATABASE__BOOTSTRAP_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      DATABASE__OWNER_URL: postgresql://app_owner:owner-ci-password@localhost:5432/postgres
+      DATABASE__APP_URL: postgresql://app_user:app-ci-password@localhost:5432/postgres
+      LOGGING__PII_PEPPER: ci-pepper
+      MODELS__CHAT_MODEL: gpt-5-mini
+      MODELS__FALLBACK_MODEL: claude-haiku-4-5
+      MODELS__EMBEDDING_MODEL: text-embedding-3-small
+      MODELS__TRANSCRIPTION_MODEL: gpt-4o-mini-transcribe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --all-groups
+      - name: Bootstrap roles, extension and grants
+        run: uv run po-db bootstrap
+      - name: Apply migrations as the owner role
+        run: uv run alembic upgrade head
+      - name: Verify the runtime role is correctly constrained
+        run: uv run po-db check
+      - name: Tests
+        run: uv run pytest --cov=personal_organizer --cov-report=xml
+
+  # Iteration 03 fills this in. Scaffolded now so it becomes a required check without a
+  # workflow change, and so the marker exists before the RLS work starts.
+  db-isolation:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP__ENV: ci
+      DATABASE__BOOTSTRAP_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      DATABASE__OWNER_URL: postgresql://app_owner:owner-ci-password@localhost:5432/postgres
+      DATABASE__APP_URL: postgresql://app_user:app-ci-password@localhost:5432/postgres
+      LOGGING__PII_PEPPER: ci-pepper
+      MODELS__CHAT_MODEL: gpt-5-mini
+      MODELS__FALLBACK_MODEL: claude-haiku-4-5
+      MODELS__EMBEDDING_MODEL: text-embedding-3-small
+      MODELS__TRANSCRIPTION_MODEL: gpt-4o-mini-transcribe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --all-groups
+      - run: uv run po-db bootstrap && uv run alembic upgrade head
+      - run: uv run pytest -m rls

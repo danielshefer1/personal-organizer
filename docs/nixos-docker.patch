@@ -1,0 +1,62 @@
+Adds the container runtime and CLI tools this project needs to ~/.dotfiles.
+
+Apply from ~/.dotfiles:
+    cd ~/.dotfiles
+    git apply --check ~/Projects/personal-organizer/docs/nixos-docker.patch
+    git apply         ~/Projects/personal-organizer/docs/nixos-docker.patch
+    sudo nixos-rebuild switch --flake ~/.dotfiles
+
+IMPORTANT: docker group membership only takes effect after a full re-login (log
+out and back in, or reboot). Until then `docker ps` fails with a permission
+error on the socket.
+
+Note home.nix uses CRLF line endings and this patch preserves them.
+
+None of this is needed for the unit tests -- only the database tests, which
+skip cleanly without a server.
+
+diff --git a/configuration.nix b/configuration.nix
+index cff34ea..ae8a2c6 100644
+--- a/configuration.nix
++++ b/configuration.nix
+@@ -25,6 +25,9 @@
+     extraGroups = [
+       "networkmanager"
+       "wheel"
++      # Talk to the docker socket without sudo.
++      # Takes effect only after a full re-login.
++      "docker"
+     ];
+     shell = pkgs.zsh;
+   };
+@@ -32,6 +35,14 @@
+   # System Shell Enablement
+   programs.zsh.enable = true;
+ 
++  # Container runtime. Used only for the local test database of
++  # ~/Projects/personal-organizer (docker-compose.yml); staging and production
++  # databases live on Railway.
++  virtualisation.docker = {
++    enable = true;
++    autoPrune.enable = true;
++  };
++
+   # Nix & Package Management Settings
+   nixpkgs.config.allowUnfree = true;
+   nix.settings.experimental-features = [
+diff --git a/home.nix b/home.nix
+index 48dacb7..b767f7a 100644
+--- a/home.nix
++++ b/home.nix
+@@ -24,6 +24,11 @@
+ 
+   home.packages = with pkgs; [
+     ripgrep
++    # personal-organizer toolchain
++    docker-compose # local Postgres (pgvector/pgvector:pg16) for the test suite
++    postgresql_16 # psql client, matching the server major used in production
++    railway # Railway CLI: logs, variables, shell
++    github-cli # gh: branch protection, PRs, CI runs
+     nautilus
+     claude-code
+     capitaine-cursors

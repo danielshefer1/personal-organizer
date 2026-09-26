@@ -1,0 +1,17 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile",
+    "watchPatterns": ["src/**", "alembic/**", "pyproject.toml", "uv.lock", "Dockerfile"]
+  },
+  "deploy": {
+    "startCommand": "uvicorn personal_organizer.api.main:app --host 0.0.0.0 --port $PORT --no-access-log",
+    "preDeployCommand": ["po-db bootstrap && alembic upgrade head"],
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 60,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10,
+    "drainingSeconds": 15
+  }
+}

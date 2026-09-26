@@ -123,6 +123,8 @@ SAFE_KEYS: Final = frozenset(
         "request_id",
         "trace_id",
         "span_id",
+        # Sentry's id for an event, so a log line can point at the Sentry issue and back.
+        "event_id",
         "tenant_id",
         "job_id",
         "session_id_hash",
@@ -163,7 +165,7 @@ SAFE_KEYS: Final = frozenset(
 #: release SHAs. They are allowlisted *for* correlation, but they are long and alphanumeric,
 #: so ``_LONG_TOKEN`` (and, for a digit-heavy id, ``_DIGITS_RUN``) would otherwise rewrite
 #: every one of them and correlate nothing with nothing. Values here skip text scrubbing
-#: only when they genuinely look like an identifier -- see :func:`_is_opaque_id` -- because
+#: only when they genuinely look like an identifier -- see :func:`is_opaque_id` -- because
 #: ``request_id`` is taken from an inbound header when one is present, so an allowlisted key
 #: is not a trusted value.
 OPAQUE_ID_KEYS: Final = frozenset(
@@ -171,6 +173,9 @@ OPAQUE_ID_KEYS: Final = frozenset(
         "request_id",
         "trace_id",
         "span_id",
+        # Sentry's own id for an event. Preserved for the same reason as the rest: it is the
+        # handle that ties a Sentry issue back to the log line that produced it.
+        "event_id",
         "tenant_id",
         "job_id",
         "session_id_hash",
@@ -290,7 +295,7 @@ def _scrub_value(value: object, depth: int = 0) -> object:
     return scrub_text(str(value))
 
 
-def _is_opaque_id(value: str) -> bool:
+def _has_id_shape(value: str) -> bool:
     """True only for values that are certainly machine-generated identifiers.
 
     Anchored and narrow on purpose: anything that is not exactly a UUID or a hex digest
@@ -303,9 +308,20 @@ def _is_opaque_id(value: str) -> bool:
     return bool(_UUID_SHAPE.match(value) or _HEX_SHAPE.match(value))
 
 
+def is_opaque_id(key: str, value: object) -> bool:
+    """True when ``value`` is a correlation id that must survive scrubbing intact.
+
+    Public because :mod:`personal_organizer.observability.sentry` needs the same judgement:
+    it scrubs Sentry events, which carry ``trace_id``, ``span_id``, ``event_id`` and
+    ``release``, and without this it would rewrite every one of them to a marker -- exactly
+    the defect this function exists to prevent on the log path.
+    """
+    return key.casefold() in OPAQUE_ID_KEYS and isinstance(value, str) and _has_id_shape(value)
+
+
 def _scrub_allowlisted(key: str, value: object) -> object:
     """Scrub a value whose key is on the allowlist, keeping correlation ids intact."""
-    if key in OPAQUE_ID_KEYS and isinstance(value, str) and _is_opaque_id(value):
+    if is_opaque_id(key, value):
         return value
     return _scrub_value(value)
 
@@ -354,6 +370,7 @@ __all__ = [
     "SECRET_KEYS",
     "Unredacted",
     "hash_identifier",
+    "is_opaque_id",
     "make_redactor",
     "redact_event",
     "scrub_text",

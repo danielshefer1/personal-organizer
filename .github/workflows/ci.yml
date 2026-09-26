@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `production` is a fast-forward of an already-green `main`, so its checks exist on the
+    # SHA before the push. Re-running them gives Railway's "Wait for CI" something to wait
+    # for on the ref it actually watches -- see docs/promotion.md.
+    branches: [main, production]
   pull_request:
 
 concurrency:

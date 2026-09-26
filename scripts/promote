@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Promote to production: fast-forward the `production` branch onto a commit of `main`
+# that CI has already proved and staging has already been running.
+#
+# There is no separate production build and no production-only commit. Railway rebuilds
+# the image from the same tree, so what ships is what staging has been running since that
+# commit merged. The branch therefore only ever moves forward, and this script refuses to
+# move it any other way.
+#
+#   scripts/promote                 promote the tip of origin/main, after confirming
+#   scripts/promote --dry-run       show what would ship, push nothing
+#   scripts/promote --yes           no prompt, for a scripted promotion
+#   scripts/promote <commit>        promote an older commit -- it must be on main
+#   scripts/promote --skip-checks   ship a commit CI has not proved; asks twice
+#
+# Overridable: PROMOTE_REMOTE, PROMOTE_SOURCE, PROMOTE_TARGET.
+
+set -euo pipefail
+
+remote=${PROMOTE_REMOTE:-origin}
+source_branch=${PROMOTE_SOURCE:-main}
+target_branch=${PROMOTE_TARGET:-production}
+
+# The jobs in .github/workflows/ci.yml, and the same list the branch ruleset requires.
+required_checks=(lint types docker test db-isolation)
+
+dry_run=false
+assume_yes=false
+skip_checks=false
+commitish=""
+
+die() { printf 'promote: %s\n' "$1" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) dry_run=true ;;
+    --yes|-y) assume_yes=true ;;
+    --skip-checks) skip_checks=true ;;
+    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) die "unknown option $1" ;;
+    *) [ -n "$commitish" ] && die "expected at most one commit"; commitish=$1 ;;
+  esac
+  shift
+done
+
+command -v gh >/dev/null || die "gh is not installed; it is what reads the CI result"
+
+echo "Fetching $remote..."
+git fetch --quiet "$remote" "$source_branch"
+git fetch --quiet "$remote" "$target_branch" 2>/dev/null || true
+
+source_sha=$(git rev-parse --verify "$remote/$source_branch")
+if [ -n "$commitish" ]; then
+  source_sha=$(git rev-parse --verify "$commitish^{commit}")
+  git merge-base --is-ancestor "$source_sha" "$remote/$source_branch" \
+    || die "$commitish is not on $remote/$source_branch; production only ships commits that went through main"
+fi
+
+# The target lives on the remote only. A stale local `production` is the one way this
+# process can grow a divergent history, so the script never creates or reads one.
+target_sha=$(git ls-remote --heads "$remote" "$target_branch" | cut -f1)
+if [ -z "$target_sha" ]; then
+  echo "$remote/$target_branch does not exist yet -- this promotion creates it."
+else
+  if [ "$target_sha" = "$source_sha" ]; then
+    echo "Already at $(git log -1 --format='%h %s' "$source_sha"). Nothing to promote."
+    exit 0
+  fi
+  git merge-base --is-ancestor "$target_sha" "$source_sha" || die \
+"$target_branch is not an ancestor of $source_sha: the branches have diverged.
+  Something was committed to $target_branch directly. Do not force-push it -- find the
+  commit ($target_sha), get it onto main, and promote forward."
+fi
+
+if $skip_checks; then
+  echo
+  echo "!! --skip-checks: shipping a commit CI has not proved."
+else
+  repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+  # Newest run per check name, so a re-run is not masked by the attempt it replaced.
+  checks=$(gh api "repos/$repo/commits/$source_sha/check-runs?per_page=100" --jq \
+    '[.check_runs[] | {name, status, conclusion, started_at}]
+       | group_by(.name)[] | max_by(.started_at)
+       | "\(.name)\t\(.status)\t\(.conclusion // "-")"')
+  for check in "${required_checks[@]}"; do
+    line=$(printf '%s\n' "$checks" | awk -F'\t' -v n="$check" '$1 == n { print; exit }')
+    [ -n "$line" ] || die "CI check '$check' has not run on $source_sha (use --skip-checks to override)"
+    status=$(printf '%s' "$line" | cut -f2)
+    conclusion=$(printf '%s' "$line" | cut -f3)
+    [ "$status" = "completed" ] || die "CI check '$check' is still $status on $source_sha"
+    [ "$conclusion" = "success" ] || die "CI check '$check' is $conclusion on $source_sha"
+  done
+  echo "CI green on $(git log -1 --format=%h "$source_sha"): ${required_checks[*]}"
+fi
+
+echo
+echo "Promoting $source_branch -> $target_branch"
+if [ -n "$target_sha" ]; then
+  git --no-pager log --oneline --no-decorate "$target_sha..$source_sha"
+  echo
+  echo "$(git rev-list --count "$target_sha..$source_sha") commit(s), $(git rev-parse --short "$target_sha") -> $(git rev-parse --short "$source_sha")"
+else
+  git --no-pager log --oneline --no-decorate -1 "$source_sha"
+fi
+
+if $dry_run; then
+  echo
+  echo "--dry-run: nothing pushed."
+  exit 0
+fi
+
+if ! $assume_yes; then
+  echo
+  printf 'Deploy this to production? [y/N] '
+  read -r reply </dev/tty
+  case "$reply" in y|Y|yes|YES) ;; *) echo "Aborted."; exit 1 ;; esac
+  if $skip_checks; then
+    printf 'CI has not proved this commit. Type the word production to confirm: '
+    read -r reply </dev/tty
+    [ "$reply" = "production" ] || { echo "Aborted."; exit 1; }
+  fi
+fi
+
+git push "$remote" "$source_sha:refs/heads/$target_branch"
+
+echo
+echo "Pushed. Railway builds from $target_branch; watch the deploy before you walk away:"
+echo "  railway logs --environment production --service api"
+echo "  curl https://<production-api>/health   # release must be $(git rev-parse --short "$source_sha")"

@@ -23,11 +23,16 @@ prevent.
 
 ## Creating it
 
-Done once, on 2026-09-26, at `95280bc`:
+The first promotion creates it — `scripts/promote` handles a missing target and says so:
 
 ```sh
-git push origin main:refs/heads/production
+scripts/promote
+# origin/production does not exist yet -- this promotion creates it.
 ```
+
+All it does in the end is `git push origin main:refs/heads/production`. The checks around that
+push are the point, and they are the same ones every later promotion goes through, so the branch
+starts its life having been through the process rather than beside it.
 
 There is deliberately no local `production` branch — not in this checkout, not in any worktree.
 A local copy is the one way this process grows a divergent history: you check it out, you commit

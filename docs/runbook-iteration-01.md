@@ -109,8 +109,8 @@ Then:
 
 - Enable **Wait for CI** on the staging services. This is what reconciles "deploys on merge"
   with "CI gates the merge", and it does it without putting a deploy token in GitHub.
-- Point production's services at the `production` branch. It exists, created at `95280bc`, and
-  moves only by a fast-forward from `main` — `scripts/promote`, described in
+- Point production's services at the `production` branch. The first `scripts/promote` creates
+  it, and every promotion after that fast-forwards it onto a green commit of `main` — see
   `docs/promotion.md`. There is never a separate production build.
 
 The trade-off of keeping migrations off the worker is that it can briefly start against the old

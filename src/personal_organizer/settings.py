@@ -52,6 +52,11 @@ class DatabaseSettings(BaseModel):
     pool_timeout: float = 10.0
     pool_recycle_seconds: int = 1800
     connect_timeout: float = 10.0
+    #: How long a starting api or worker keeps retrying its first connection. Covers a
+    #: platform whose private network is not routable for the first seconds of a
+    #: container's life; it is not a substitute for a DSN that points somewhere real,
+    #: which fails on the first attempt regardless. See ``Database.wait_ready``.
+    startup_timeout: float = 30.0
     statement_timeout_ms: int = 15_000
     # A leaked open transaction is a pooled connection stuck with a tenant GUC set, so this
     # is a correctness guard for the RLS design, not just hygiene.

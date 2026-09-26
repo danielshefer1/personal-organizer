@@ -270,8 +270,39 @@ as a failed healthcheck and a rollback:
    problem and raises once, so you get all of them in one message rather than one per retry.
 2. `po-db bootstrap` failing in pre-deploy — almost always `DATABASE__BOOTSTRAP_URL` pointing at
    a non-superuser, or pgvector below 0.5 because the image tag was not pinned.
-3. The eager `database.check()` in `api/lifespan.py` — a DSN that resolves but whose role does not
-   exist yet, which means bootstrap did not actually run.
+3. The eager `database.wait_ready()` in `api/lifespan.py` — a DSN that resolves but whose role
+   does not exist yet, which means bootstrap did not actually run.
+
+#### A service that starts, cannot reach the database, and exits — over and over
+
+Observed in production on 2026-09-26: `Started server process`, two seconds of asyncpg
+traceback, `Application startup failed. Exiting.`, and a new container two seconds later,
+indefinitely. Each restart is a fresh container, so a cause that only bites a *cold* one never
+clears on its own.
+
+**Read the one line above the traceback, not the traceback.** `db.startup_retry` and
+`db.startup_timeout` name the `db_host`, `db_port` and `db_name` that were not answering; the
+two hundred lines of SQLAlchemy and greenlet frames below them name nothing useful. If those
+log lines are absent, the deploy predates this and the answer is below.
+
+Two causes produce an identical hang, because a connection to a host that is not routable and
+one to a host that does not exist both end as a cancelled `create_connection`:
+
+- **The private network is not up yet.** It is not routable for the first seconds of a
+  container's life. `Database.wait_ready` now retries for `DATABASE__STARTUP_TIMEOUT` seconds
+  (30 by default) instead of probing once for two, which is what made this fatal.
+- **`DATABASE__APP_URL` points somewhere else.** Narrow it in one look: *reaching* `Started
+  server process` at all proves the pre-deploy command succeeded, and that proves
+  `DATABASE__BOOTSTRAP_URL` and `DATABASE__OWNER_URL` reach a real database over the private
+  network. The api's own probe is the only thing that uses `DATABASE__APP_URL`. So if the host
+  in the app URL differs from the host in the owner URL, that is the bug:
+
+  ```sh
+  railway variables --environment production --service api | grep DATABASE__
+  ```
+
+  A wrong *password* or an absent *role* in that URL does not look like this — those fail on
+  the first attempt with `db.startup_rejected` and an `error_code`, deliberately.
 
 ---
 

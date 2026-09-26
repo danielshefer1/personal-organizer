@@ -4,7 +4,7 @@ import ssl
 
 import pytest
 
-from personal_organizer.db.dsn import normalise
+from personal_organizer.db.dsn import Target, describe, normalise
 
 RAILWAY = "postgres://app_user:pw@shinkansen.proxy.rlwy.net:5432/railway?sslmode=require"
 PRIVATE = "postgresql://app_user:pw@postgres.railway.internal:5432/railway?sslmode=disable"
@@ -71,3 +71,23 @@ class TestLibpqParameterLifting:
         url, _ = normalise("postgres://u:p@h/db?application_name=x&foo=bar", "asyncpg")
         assert "foo=bar" in url
         assert "application_name" not in url
+
+
+class TestDescribe:
+    """What a connection failure is allowed to say about where it was pointed."""
+
+    def test_reports_host_port_and_database(self) -> None:
+        assert describe(PRIVATE) == Target("postgres.railway.internal", 5432, "railway")
+
+    def test_never_carries_the_password(self) -> None:
+        assert "pw" not in "".join(str(part) for part in describe(RAILWAY))
+
+    def test_a_missing_port_is_none_rather_than_a_guess(self) -> None:
+        assert describe("postgresql://u:p@h/db").port is None
+
+    def test_an_unresolved_platform_reference_is_visible_rather_than_fatal(self) -> None:
+        """`${{Postgres.PGHOST}}` resolving to nothing is the failure being reported."""
+        assert describe("postgresql://u:p@/railway").host == ""
+
+    def test_a_malformed_port_does_not_raise_over_the_error_being_reported(self) -> None:
+        assert describe("postgresql://u:p@h:not-a-port/db").port is None

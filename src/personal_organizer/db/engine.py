@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Final
 
 import structlog
 from sqlalchemy import text
@@ -21,7 +22,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from personal_organizer.core.types import TenantId
-from personal_organizer.db.dsn import normalise
+from personal_organizer.db.dsn import describe, normalise
 from personal_organizer.db.roles import DatabaseRole
 from personal_organizer.db.session import TENANT_INFO_KEY
 from personal_organizer.settings import Settings
@@ -29,6 +30,44 @@ from personal_organizer.settings import Settings
 log = structlog.get_logger(__name__)
 
 READY_TIMEOUT_S = 2.0
+
+_RETRY_INITIAL_S: Final = 0.5
+_RETRY_MAX_S: Final = 4.0
+
+#: SQLSTATEs that no amount of waiting fixes: the password, the role or the database is
+#: wrong. :meth:`Database.wait_ready` raises these on the first attempt, which is the
+#: fail-fast the eager startup check exists for.
+_FATAL_SQLSTATES: Final = frozenset(
+    {
+        "28P01",  # invalid_password
+        "28000",  # invalid_authorization_specification -- includes a role that is absent
+        "3D000",  # invalid_catalog_name -- no such database
+        "42501",  # insufficient_privilege
+    }
+)
+
+
+def _fatal_sqlstate(exc: BaseException) -> str | None:
+    """The SQLSTATE of a configuration error anywhere in ``exc``'s chain.
+
+    Walks the chain rather than inspecting ``exc`` itself: SQLAlchemy wraps the asyncpg
+    error in a ``DBAPIError`` (under ``orig``) and asyncpg chains its own beneath that, so
+    the exception actually raised is almost never the one carrying the SQLSTATE.
+    """
+    seen: set[int] = set()
+    queue: list[BaseException] = [exc]
+    while queue:
+        current = queue.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        sqlstate = getattr(current, "sqlstate", None)
+        if isinstance(sqlstate, str) and sqlstate in _FATAL_SQLSTATES:
+            return sqlstate
+        for nested in (current.__cause__, current.__context__, getattr(current, "orig", None)):
+            if isinstance(nested, BaseException):
+                queue.append(nested)
+    return None
 
 
 class Database:
@@ -110,6 +149,87 @@ class Database:
         """
         async with asyncio.timeout(READY_TIMEOUT_S), self.engine(role).connect() as conn:
             await conn.execute(text("SELECT 1"))
+
+    async def wait_ready(
+        self,
+        *,
+        role: DatabaseRole = DatabaseRole.APP,
+        budget: float | None = None,
+        initial_backoff: float = _RETRY_INITIAL_S,
+    ) -> None:
+        """Block until the database answers, or give up after ``budget`` seconds.
+
+        ``budget`` bounds the retrying, not any one attempt: each probe is still capped at
+        :data:`READY_TIMEOUT_S` by :meth:`check`.
+
+        :meth:`check` is the right probe for ``/ready``, where a bounded answer matters
+        more than a patient one. Startup is the opposite case, and sharing one two-second
+        attempt between them is what turned a cold start into a crash loop on Railway,
+        whose private network is not routable for the first seconds of a container's life:
+        the probe timed out, the process exited, the platform started another container,
+        and that one was cold too. Nothing recovers from that on its own, and the traceback
+        blames a connection timeout rather than a check that was too eager to wait.
+
+        Wrong credentials, an absent role and an absent database are still raised on the
+        first attempt. Retrying those only delays the report, and reporting them
+        immediately is what the eager check was for.
+        """
+        seconds = self._settings.database.startup_timeout if budget is None else budget
+        target = describe(self._settings.dsn_for(role))
+        where = {
+            "db_role": role.value,
+            "db_host": target.host,
+            "db_port": target.port,
+            "db_name": target.database,
+        }
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + seconds
+        started = loop.time()
+        backoff = initial_backoff
+        attempt = 0
+
+        while True:
+            attempt += 1
+            try:
+                await self.check(role=role)
+            except Exception as exc:
+                elapsed_ms = int((loop.time() - started) * 1000)
+                if (sqlstate := _fatal_sqlstate(exc)) is not None:
+                    log.error(
+                        "db.startup_rejected",
+                        **where,
+                        attempt=attempt,
+                        error_type=type(exc).__name__,
+                        error_code=sqlstate,
+                    )
+                    raise
+                if (remaining := deadline - loop.time()) <= 0:
+                    log.error(
+                        "db.startup_timeout",
+                        **where,
+                        attempt=attempt,
+                        duration_ms=elapsed_ms,
+                        error_type=type(exc).__name__,
+                    )
+                    raise
+                log.warning(
+                    "db.startup_retry",
+                    **where,
+                    attempt=attempt,
+                    duration_ms=elapsed_ms,
+                    error_type=type(exc).__name__,
+                )
+                await asyncio.sleep(min(backoff, remaining))
+                backoff = min(backoff * 2, _RETRY_MAX_S)
+            else:
+                if attempt > 1:
+                    log.info(
+                        "db.ready",
+                        **where,
+                        attempt=attempt,
+                        duration_ms=int((loop.time() - started) * 1000),
+                    )
+                return
 
     async def dispose(self) -> None:
         for engine in self._engines.values():

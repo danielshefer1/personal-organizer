@@ -17,6 +17,7 @@ package stops matching the vendored copy.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -29,6 +30,15 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 VENDORED_SQL = Path(__file__).resolve().parents[1] / "vendor" / "procrastinate_3.10.sql"
+
+# The downgrade drops exactly what the vendored SQL creates, read back out of that same file
+# rather than hand-listed here. Hand-listing is what left the original version dropping three
+# of the four tables and none of the types or functions, so `downgrade` then `upgrade` failed
+# on "type procrastinate_job_status already exists" -- and it would drift again on the next
+# procrastinate bump. Triggers and indexes need no entry: they go with their table's CASCADE.
+_TABLES = re.compile(r"CREATE TABLE(?: IF NOT EXISTS)?\s+(\w+)", re.IGNORECASE)
+_TYPES = re.compile(r"CREATE TYPE\s+(\w+)", re.IGNORECASE)
+_FUNCTIONS = re.compile(r"CREATE(?: OR REPLACE)? FUNCTION\s+(\w+)", re.IGNORECASE)
 
 
 def upgrade() -> None:
@@ -46,10 +56,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("DROP SCHEMA IF EXISTS procrastinate CASCADE")
-    for table in (
-        "procrastinate_periodic_defers",
-        "procrastinate_events",
-        "procrastinate_jobs",
-    ):
+    sql = VENDORED_SQL.read_text()
+
+    # Tables first: that takes the triggers and indexes with them, so the trigger functions
+    # and the enum types below have nothing depending on them by the time they are dropped.
+    for table in _TABLES.findall(sql):
         op.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+    # No argument list: every function the vendored schema defines has a distinct name, so
+    # there is no overload for Postgres to be ambiguous about.
+    for function in _FUNCTIONS.findall(sql):
+        op.execute(f"DROP FUNCTION IF EXISTS {function} CASCADE")
+    for type_name in _TYPES.findall(sql):
+        op.execute(f"DROP TYPE IF EXISTS {type_name} CASCADE")

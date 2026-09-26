@@ -81,7 +81,7 @@ healthy, and the queue is never drained.
 
 | Setting | Value |
 |---|---|
-| Pre-deploy command | `po-db bootstrap && alembic upgrade head` |
+| Pre-deploy command | `sh -c "po-db bootstrap && alembic upgrade head"` — **the `sh -c` is required** |
 | Healthcheck path | `/health` |
 
 Per service, per environment. The worker gets neither: no pre-deploy, because two services racing
@@ -90,7 +90,13 @@ would fail it.
 
 Both failures are indirect, so know the symptoms:
 
-- No `preDeployCommand`, so `po-db bootstrap` and `alembic upgrade head` never run. `app_owner`
+- **A pre-deploy command without `sh -c`.** Railway does not run that field through a shell,
+  so a bare `po-db bootstrap && alembic upgrade head` executes `po-db` and discards the rest:
+  bootstrap logs `db.bootstrap.ok`, the migration never runs, and the api starts happily
+  because it only needs a connection. The worker is what dies, on
+  `function procrastinate_prune_stalled_workers_v1(double precision) does not exist`. Observed;
+  wrapping the command in `sh -c` fixed it with no other change.
+- No pre-deploy command at all, so `po-db bootstrap` and `alembic upgrade head` never run. `app_owner`
   and `app_user` are never created, and the api dies in its lifespan on
   `password authentication failed for user "app_user"` — which is what PostgreSQL says for a role
   that *does not exist*, since it deliberately does not distinguish the two. It reads like a
@@ -167,8 +173,8 @@ it unreachable when deployed.
    and a staging service with no token set refuses to boot. Production does not mount the router
    at all, so it needs no token.
 3. **`DATABASE__BOOTSTRAP_URL` is only needed by the pre-deploy command**, but it *is* needed:
-   the api's pre-deploy command runs `po-db bootstrap && alembic upgrade head` before every
-   deploy, and
+   the api's pre-deploy command runs `sh -c "po-db bootstrap && alembic upgrade head"` before
+   every deploy, and
    bootstrap is the only tier that may `CREATE EXTENSION` and `CREATE ROLE`.
 4. **`railway add -d postgres` provisions the wrong thing.** It ignores both the project region
    and any version pin, giving the latest major in Railway's default US region — observed as
@@ -179,6 +185,14 @@ it unreachable when deployed.
    service scale` moves a stateless service between regions but **adds** a replica rather than
    moving it — pass the old region explicitly at zero, e.g.
    `railway service scale --service worker europe-west4-drams3a=1 sfo=0`.
+
+5. **Railway injects `PORT` at runtime, and it is 8080 — but it does not appear in
+   `railway variables list`**, which shows only variables you set. The Dockerfile `CMD` uses
+   `${PORT:-8000}`, so the container listens on 8080 in Railway and 8000 locally. A generated
+   service domain must therefore target **8080**: `railway domain --port 8000` produces a domain
+   that returns `502 Application failed to respond` while the app is running perfectly and the
+   deploy is marked SUCCESS. Check with `railway logs` for `Uvicorn running on http://0.0.0.0:<port>`
+   and match the domain to it (`railway domain update <id> --port 8080`).
 
 ### What the CLI can and cannot do
 

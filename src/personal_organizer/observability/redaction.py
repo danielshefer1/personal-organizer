@@ -141,8 +141,12 @@ SAFE_KEYS: Final = frozenset(
         "attempt",
         "priority",
         "lock",
-        # db
+        # db -- infrastructure coordinates, so that a connection failure says which host it
+        # could not reach. The password lives in the DSN and never in these.
         "db_role",
+        "db_host",
+        "db_port",
+        "db_name",
         "table",
         "rows",
         # llm

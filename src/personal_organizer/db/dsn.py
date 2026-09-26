@@ -15,7 +15,7 @@ Three things are wrong with feeding that to our consumers directly:
 from __future__ import annotations
 
 import ssl
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 Driver = Literal["asyncpg", "psycopg", "libpq"]
@@ -66,6 +66,33 @@ def _ssl_context_for(sslmode: str) -> ssl.SSLContext | bool:
             raise ValueError(msg)
 
 
+class Target(NamedTuple):
+    """The part of a DSN that is safe to log. No password, by construction."""
+
+    host: str
+    port: int | None
+    database: str
+
+
+def describe(raw: str) -> Target:
+    """Where a DSN points, for a log line.
+
+    A failed connection is close to unreadable without this: the traceback names asyncpg,
+    SQLAlchemy and greenlets for two hundred lines and never once the host it could not
+    reach, which is the only thing you need in order to tell a cold network apart from a
+    DSN pointing at nothing. Built from the parsed URL rather than by stripping the
+    password out of the string, so there is no regex here to get wrong.
+    """
+    parts = urlsplit(raw.strip())
+    try:
+        port = parts.port
+    except ValueError:
+        # This runs while reporting another failure. A malformed port is part of what is
+        # being reported, not a reason to raise over the top of it.
+        port = None
+    return Target(host=parts.hostname or "", port=port, database=parts.path.lstrip("/"))
+
+
 def normalise(raw: str, driver: Driver) -> tuple[str, dict[str, Any]]:
     """Return ``(url, connect_args)`` for the given driver.
 
@@ -103,4 +130,4 @@ def normalise(raw: str, driver: Driver) -> tuple[str, dict[str, Any]]:
     return url, connect_args
 
 
-__all__ = ["LIBPQ_ONLY_PARAMS", "Driver", "normalise"]
+__all__ = ["LIBPQ_ONLY_PARAMS", "Driver", "Target", "describe", "normalise"]

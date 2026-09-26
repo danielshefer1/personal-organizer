@@ -29,7 +29,7 @@ async def run(settings: Settings) -> None:
     async with AsyncExitStack() as stack:
         database = Database(settings)
         stack.push_async_callback(database.dispose)
-        await database.check()
+        await database.wait_ready()
         # Tasks get no dependency injection, so the instance is registered process-wide.
         set_database(database)
 

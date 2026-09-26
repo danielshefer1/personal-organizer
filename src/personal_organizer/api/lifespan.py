@@ -2,8 +2,10 @@
 
 Resources are acquired in dependency order and released in reverse via an ``AsyncExitStack``.
 
-The eager ``db.check()`` is deliberate: a bad DSN or a missing role then fails the deploy
-immediately, rather than surfacing on the first real request minutes later.
+The eager ``db.wait_ready()`` is deliberate: a bad DSN or a missing role then fails the
+deploy immediately, rather than surfacing on the first real request minutes later. It waits
+rather than probing once, because the platform's private network needs a moment at container
+start and a single attempt makes that indistinguishable from a database that is not there.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ def make_lifespan(
         async with AsyncExitStack() as stack:
             database = Database(settings)
             stack.push_async_callback(database.dispose)
-            await database.check()
+            await database.wait_ready()
             set_database(database)
             app.state.db = database
 

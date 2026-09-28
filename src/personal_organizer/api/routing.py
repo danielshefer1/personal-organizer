@@ -1,7 +1,7 @@
 """Raw-body preservation for the webhook router.
 
-Meta computes ``X-Hub-Signature-256`` over the **exact bytes** it sent, so Iteration 02 must
-verify the HMAC against those bytes and not against a re-serialised parse.
+Meta computes ``X-Hub-Signature-256`` over the **exact bytes** it sent, so ``/webhooks/whatsapp``
+verifies the HMAC against those bytes and not against a re-serialised parse.
 
 This is a route class rather than middleware on purpose: global middleware would buffer every
 request body, including future streaming ones. Scoped to the webhook router, it buffers only

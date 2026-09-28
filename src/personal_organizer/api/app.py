@@ -14,7 +14,8 @@ from starlette.status import HTTP_422_UNPROCESSABLE_CONTENT, HTTP_500_INTERNAL_S
 from personal_organizer import __version__
 from personal_organizer.api.lifespan import make_lifespan
 from personal_organizer.api.middleware import RequestContextMiddleware
-from personal_organizer.api.routers import health, internal
+from personal_organizer.api.routers import health, internal, webhooks
+from personal_organizer.providers.channel.whatsapp.inbound import WhatsAppInbound
 from personal_organizer.settings import Settings
 
 log = structlog.get_logger(__name__)
@@ -40,12 +41,17 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.settings = settings
 
     # NOTE: do not add GZipMiddleware or anything else that rewrites request bodies above
-    # the webhook router -- Iteration 02 verifies an HMAC over the exact received bytes.
+    # the webhook router -- it verifies an HMAC over the exact received bytes.
     app.add_middleware(RequestContextMiddleware)
 
     app.include_router(health.router)
     if settings.app.env != "production":
         app.include_router(internal.router)
+    # Not mounted at all until configured, so a deploy without Meta credentials exposes
+    # nothing -- rather than a route that must remember to reject everything.
+    if settings.whatsapp.enabled:
+        app.state.inbound_channel = WhatsAppInbound.from_settings(settings.whatsapp)
+        app.include_router(webhooks.router)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:

@@ -3,8 +3,8 @@
 Deliberately not the ``procrastinate`` CLI: that would give unstructured stdlib logs and no
 Sentry, whereas this initialises logging, Sentry and settings exactly as the api does. Since
 :func:`configure_logging` installs the redaction chain on the root logger, Procrastinate's
-own logging -- which records job kwargs, and from Iteration 02 those carry message bodies --
-is redacted too.
+own logging -- which records job kwargs, and would log a message body if one were ever passed
+as one (docs/adr/0001 forbids it) -- is redacted too.
 """
 
 from __future__ import annotations
@@ -13,16 +13,33 @@ import asyncio
 import sys
 from contextlib import AsyncExitStack
 
+import httpx
 import structlog
 
 from personal_organizer.db.engine import Database, set_database
+from personal_organizer.messaging.runtime import set_outbound_channel
 from personal_organizer.observability.langfuse import flush_langfuse, init_langfuse
 from personal_organizer.observability.logging import configure_logging
 from personal_organizer.observability.sentry import init_sentry
+from personal_organizer.providers.channel.whatsapp.outbound import WhatsAppOutbound
 from personal_organizer.settings import Settings, get_settings
 from personal_organizer.worker.app import build_procrastinate_app
 
 log = structlog.get_logger(__name__)
+
+
+async def _open_whatsapp(settings: Settings, stack: AsyncExitStack) -> None:
+    """One HTTP client for the process, closed with it. Tasks reach it through the runtime
+    registry, like the database."""
+    whatsapp = settings.whatsapp
+    http = await stack.enter_async_context(
+        httpx.AsyncClient(
+            base_url=f"{whatsapp.graph_base_url.rstrip('/')}/{whatsapp.graph_api_version}/",
+            timeout=httpx.Timeout(whatsapp.send_timeout_s, connect=5.0),
+        )
+    )
+    set_outbound_channel(WhatsAppOutbound.from_settings(whatsapp, http))
+    stack.callback(set_outbound_channel, None)
 
 
 async def run(settings: Settings) -> None:
@@ -36,6 +53,9 @@ async def run(settings: Settings) -> None:
         init_langfuse(settings)
         stack.callback(flush_langfuse)
 
+        if settings.whatsapp.enabled:
+            await _open_whatsapp(settings, stack)
+
         app = build_procrastinate_app(settings)
         await stack.enter_async_context(app.open_async())
 
@@ -43,6 +63,8 @@ async def run(settings: Settings) -> None:
             "worker.started",
             env=settings.app.env,
             release=settings.app.release,
+            whatsapp_enabled=settings.whatsapp.enabled,
+            allowlist_size=len(settings.whatsapp.allowlist),
         )
         await app.run_worker_async(
             queues=settings.worker.queues,

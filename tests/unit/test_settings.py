@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import pytest
@@ -105,4 +106,56 @@ class TestDeployedInvariants:
     def test_local_is_permissive(self, settings_factory: Any) -> None:
         cfg = settings_factory(APP__ENV="local", LOGGING__ALLOW_RAW_PII="true")
         assert cfg.logging.allow_raw_pii
+        assert not cfg.is_deployed
+
+
+class TestThePlatformGuard:
+    """`APP__ENV` is what every other check is gated on, so it cannot be optional.
+
+    Unset, it defaults to "local", and the failure is silent in the worst direction: no
+    check fires, the placeholder pepper is accepted, and `/internal` mounts itself on a
+    public URL with its token check disabled. So a container the platform is running is not
+    allowed to claim it is a laptop.
+    """
+
+    def test_a_platform_container_without_app_env_refuses_to_boot(
+        self, settings_factory: Any, monkeypatch: Any
+    ) -> None:
+        monkeypatch.delenv("APP__ENV", raising=False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT_NAME", "production")
+        with pytest.raises(ValidationError, match="APP__ENV"):
+            settings_factory(APP__ENV="local")
+
+    def test_any_platform_variable_is_enough(self, settings_factory: Any, monkeypatch: Any) -> None:
+        """Detected by prefix: the exact set the platform injects is not ours to depend on."""
+        monkeypatch.setenv("RAILWAY_SERVICE_NAME", "api")
+        with pytest.raises(ValidationError, match="APP__ENV"):
+            settings_factory(APP__ENV="local")
+
+    def test_ci_on_the_platform_is_rejected_too(
+        self, settings_factory: Any, monkeypatch: Any
+    ) -> None:
+        """`ci` is not deployed either, and it is the other value that disables the checks."""
+        monkeypatch.setenv("RAILWAY_PROJECT_ID", "p-1")
+        with pytest.raises(ValidationError, match="APP__ENV"):
+            settings_factory(APP__ENV="ci")
+
+    def test_a_declared_environment_on_the_platform_is_fine(
+        self, settings_factory: Any, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT_NAME", "production")
+        cfg = settings_factory(
+            APP__ENV="production",
+            SENTRY__DSN="https://k@o.ingest.sentry.io/1",
+            LOGGING__PII_PEPPER="a-real-secret",
+        )
+        assert cfg.is_deployed
+
+    def test_off_the_platform_local_stays_permissive(
+        self, settings_factory: Any, monkeypatch: Any
+    ) -> None:
+        """The guard must not reach a laptop or a CI runner, which have no such variables."""
+        for name in [key for key in os.environ if key.startswith("RAILWAY_")]:
+            monkeypatch.delenv(name, raising=False)
+        cfg = settings_factory(APP__ENV="local")
         assert not cfg.is_deployed

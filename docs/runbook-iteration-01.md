@@ -138,7 +138,7 @@ scheme and driver rewriting. Verified resolving to `postgres.railway.internal:54
 
 | Variable | Value |
 |---|---|
-| `APP__ENV` | `staging` / `production` |
+| `APP__ENV` | `staging` / `production` — **set this one first**; see the trap below |
 | `APP__COMPONENT` | `api` on the api service, `worker` on the worker |
 | `APP__RELEASE` | **unresolved** — the obvious reference yields `""`; see the trap below |
 | `APP__DEBUG` | `false` |
@@ -159,7 +159,30 @@ scheme and driver rewriting. Verified resolving to `postgres.railway.internal:54
 Do **not** set `LOGGING__ALLOW_RAW_PII`. It exists for local debugging and the validator makes
 it unreachable when deployed.
 
-### Three traps worth reading twice
+### Traps worth reading twice
+
+0. **Omitting `APP__ENV` does not mislabel the environment — it disables every safety check
+   at once.** This happened in production on 2026-09-26 and cost most of a debugging session,
+   because nothing in the logs points at it. The field defaults to `"local"`, `is_deployed`
+   goes false, and `_enforce_deployed_invariants` returns before running a single check. The
+   consequences, none of which announce themselves:
+
+   - `LOGGING__PII_PEPPER` is allowed to stay at the placeholder that is **committed to this
+     repository**, so hashed identifiers in production logs are reversible by anyone who reads
+     `settings.py`.
+   - `SENTRY__DSN` stops being required, so errors go nowhere.
+   - `DATABASE__OWNER_URL` stops being required. It is needed anyway, so the omission comes
+     back later as an obscure failure inside the pre-deploy command rather than a named
+     problem at startup.
+   - `/internal/ping` **mounts itself on the public production URL** — the router is included
+     whenever the env is not `"production"` — and its token check waves callers through,
+     because that check also defers to `is_deployed`. Two guards, one variable, both off.
+   - `LOGGING__RENDERER` and `APP__DEBUG` are no longer constrained.
+
+   `Settings` now refuses to construct when any `RAILWAY_`-prefixed variable is present and
+   `APP__ENV` is not `staging` or `production`, which turns this from silence into a named
+   failure in the pre-deploy log. Confirm from outside with `/health`: if `env` reads `local`
+   on a deployed service, this is what happened.
 
 1. **`APP__RELEASE` is not wired automatically, and the obvious fix does not work either.**
    `settings.py` documents it as coming from `RAILWAY_GIT_COMMIT_SHA`, but nothing in the code

@@ -17,6 +17,7 @@ import structlog
 
 from personal_organizer.core.errors import BootstrapError
 from personal_organizer.db.dsn import normalise
+from personal_organizer.db.engine import log_target, retry_until_ready
 from personal_organizer.db.roles import DatabaseRole
 from personal_organizer.settings import Settings
 
@@ -25,6 +26,9 @@ log = structlog.get_logger(__name__)
 BOOTSTRAP_SQL = Path(__file__).resolve().parents[3] / "alembic" / "bootstrap.sql"
 
 MIN_PGVECTOR = (0, 5, 0)
+
+#: Upper bound on one connection attempt; ``DATABASE__STARTUP_TIMEOUT`` bounds the retrying.
+ATTEMPT_TIMEOUT_S = 5.0
 
 
 def _credentials(dsn: str) -> tuple[str, str]:
@@ -36,11 +40,25 @@ def _credentials(dsn: str) -> tuple[str, str]:
 
 
 async def _connect(settings: Settings, role: DatabaseRole) -> Any:
-    url, connect_args = normalise(settings.dsn_for(role), "asyncpg")
-    return await asyncpg.connect(
-        url.replace("postgresql+asyncpg://", "postgresql://", 1),
-        ssl=connect_args.get("ssl"),
-        timeout=connect_args.get("timeout", settings.database.connect_timeout),
+    """Connect, retrying while the network comes up.
+
+    ``po-db`` runs as Railway's pre-deploy command, in a container of its own that is as
+    cold as the api's: its private network is not routable for the first seconds. A single
+    attempt timed out there on the 2026-09-28 production deploys, so this waits as the api
+    does at startup. Each attempt is capped at :data:`ATTEMPT_TIMEOUT_S` so that one hung
+    connect cannot spend the whole budget.
+    """
+    dsn = settings.dsn_for(role)
+    url, connect_args = normalise(dsn, "asyncpg")
+    timeout = min(connect_args.get("timeout", settings.database.connect_timeout), ATTEMPT_TIMEOUT_S)
+    return await retry_until_ready(
+        lambda: asyncpg.connect(
+            url.replace("postgresql+asyncpg://", "postgresql://", 1),
+            ssl=connect_args.get("ssl"),
+            timeout=timeout,
+        ),
+        where=log_target(role, dsn),
+        budget=settings.database.startup_timeout,
     )
 
 

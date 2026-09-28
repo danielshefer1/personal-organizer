@@ -304,6 +304,20 @@ one to a host that does not exist both end as a cancelled `create_connection`:
   A wrong *password* or an absent *role* in that URL does not look like this — those fail on
   the first attempt with `db.startup_rejected` and an `error_code`, deliberately.
 
+#### The pre-deploy command times out connecting
+
+Observed in production on 2026-09-28: the deploy fails before the api starts, and the pre-deploy
+log ends in `bootstrap.py … _connect … asyncpg.connect … TimeoutError`. The pre-deploy command
+runs in a fresh container of its own, so it is exactly as cold as the api's. It used to connect
+once, and only the api had learned to wait. `po-db` now goes through the same
+`retry_until_ready` as `Database.wait_ready`: up to `DATABASE__STARTUP_TIMEOUT` seconds, at most
+five seconds per attempt, logging the same `db.startup_retry` / `db.startup_timeout` lines with
+`db_role` and `db_host`.
+
+If it still times out after the full budget, the network is not the problem, so read `db_host`.
+For `db_role=bootstrap` it must be the Postgres service's private host (`*.railway.internal`)
+in the same environment. Anything else means `DATABASE__BOOTSTRAP_URL` points at the wrong place.
+
 ---
 
 ## What is deliberately not in this iteration

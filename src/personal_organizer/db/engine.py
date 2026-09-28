@@ -8,9 +8,9 @@ own their instance explicitly.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Final
+from typing import Any, Final
 
 import structlog
 from sqlalchemy import text
@@ -68,6 +68,82 @@ def _fatal_sqlstate(exc: BaseException) -> str | None:
             if isinstance(nested, BaseException):
                 queue.append(nested)
     return None
+
+
+def log_target(role: DatabaseRole, dsn: str) -> dict[str, Any]:
+    """Log fields naming the database a connection attempt was for. No password."""
+    target = describe(dsn)
+    return {
+        "db_role": role.value,
+        "db_host": target.host,
+        "db_port": target.port,
+        "db_name": target.database,
+    }
+
+
+async def retry_until_ready[T](
+    probe: Callable[[], Awaitable[T]],
+    *,
+    where: dict[str, Any],
+    budget: float,
+    initial_backoff: float = _RETRY_INITIAL_S,
+) -> T:
+    """Call ``probe`` until it succeeds, or give up after ``budget`` seconds.
+
+    Shared by every caller that is first to touch the database from a fresh container: the
+    api and worker at startup (:meth:`Database.wait_ready`) and ``po-db`` in the pre-deploy
+    command. All of them run on a private network that may not be routable yet. Errors
+    :func:`_fatal_sqlstate` recognises are raised on the first attempt; anything else is
+    retried with backoff, and the last error is re-raised once the budget is spent.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    started = loop.time()
+    backoff = initial_backoff
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            result = await probe()
+        except Exception as exc:
+            elapsed_ms = int((loop.time() - started) * 1000)
+            if (sqlstate := _fatal_sqlstate(exc)) is not None:
+                log.error(
+                    "db.startup_rejected",
+                    **where,
+                    attempt=attempt,
+                    error_type=type(exc).__name__,
+                    error_code=sqlstate,
+                )
+                raise
+            if (remaining := deadline - loop.time()) <= 0:
+                log.error(
+                    "db.startup_timeout",
+                    **where,
+                    attempt=attempt,
+                    duration_ms=elapsed_ms,
+                    error_type=type(exc).__name__,
+                )
+                raise
+            log.warning(
+                "db.startup_retry",
+                **where,
+                attempt=attempt,
+                duration_ms=elapsed_ms,
+                error_type=type(exc).__name__,
+            )
+            await asyncio.sleep(min(backoff, remaining))
+            backoff = min(backoff * 2, _RETRY_MAX_S)
+        else:
+            if attempt > 1:
+                log.info(
+                    "db.ready",
+                    **where,
+                    attempt=attempt,
+                    duration_ms=int((loop.time() - started) * 1000),
+                )
+            return result
 
 
 class Database:
@@ -175,61 +251,12 @@ class Database:
         immediately is what the eager check was for.
         """
         seconds = self._settings.database.startup_timeout if budget is None else budget
-        target = describe(self._settings.dsn_for(role))
-        where = {
-            "db_role": role.value,
-            "db_host": target.host,
-            "db_port": target.port,
-            "db_name": target.database,
-        }
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + seconds
-        started = loop.time()
-        backoff = initial_backoff
-        attempt = 0
-
-        while True:
-            attempt += 1
-            try:
-                await self.check(role=role)
-            except Exception as exc:
-                elapsed_ms = int((loop.time() - started) * 1000)
-                if (sqlstate := _fatal_sqlstate(exc)) is not None:
-                    log.error(
-                        "db.startup_rejected",
-                        **where,
-                        attempt=attempt,
-                        error_type=type(exc).__name__,
-                        error_code=sqlstate,
-                    )
-                    raise
-                if (remaining := deadline - loop.time()) <= 0:
-                    log.error(
-                        "db.startup_timeout",
-                        **where,
-                        attempt=attempt,
-                        duration_ms=elapsed_ms,
-                        error_type=type(exc).__name__,
-                    )
-                    raise
-                log.warning(
-                    "db.startup_retry",
-                    **where,
-                    attempt=attempt,
-                    duration_ms=elapsed_ms,
-                    error_type=type(exc).__name__,
-                )
-                await asyncio.sleep(min(backoff, remaining))
-                backoff = min(backoff * 2, _RETRY_MAX_S)
-            else:
-                if attempt > 1:
-                    log.info(
-                        "db.ready",
-                        **where,
-                        attempt=attempt,
-                        duration_ms=int((loop.time() - started) * 1000),
-                    )
-                return
+        await retry_until_ready(
+            lambda: self.check(role=role),
+            where=log_target(role, self._settings.dsn_for(role)),
+            budget=seconds,
+            initial_backoff=initial_backoff,
+        )
 
     async def dispose(self) -> None:
         for engine in self._engines.values():
@@ -254,4 +281,11 @@ def get_database() -> Database:
     return _database
 
 
-__all__ = ["READY_TIMEOUT_S", "Database", "get_database", "set_database"]
+__all__ = [
+    "READY_TIMEOUT_S",
+    "Database",
+    "get_database",
+    "log_target",
+    "retry_until_ready",
+    "set_database",
+]

@@ -49,8 +49,10 @@ def require_internal_token(request: Request) -> None:
             raise HTTPException(status_code=HTTP_404_NOT_FOUND)
         return
     supplied = request.headers.get(INTERNAL_TOKEN_HEADER, "")
-    # compare_digest, not ==, so a rejection takes the same time whatever the prefix.
-    if not secrets.compare_digest(supplied, expected.get_secret_value()):
+    # compare_digest, not ==, so a rejection takes the same time whatever the prefix. On
+    # bytes, not str: the str form raises TypeError for non-ASCII input, and Starlette decodes
+    # headers as latin-1, so a crafted header would otherwise answer 500 rather than 404.
+    if not secrets.compare_digest(supplied.encode(), expected.get_secret_value().encode()):
         log.warning("internal.token_rejected", path=request.url.path)
         raise HTTPException(status_code=HTTP_404_NOT_FOUND)
 

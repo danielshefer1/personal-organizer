@@ -2,9 +2,9 @@
 
 Everything -- our own loggers *and* third-party stdlib loggers -- is funnelled through one
 renderer chain whose last step before rendering is the redactor. That matters more than it
-looks: Procrastinate logs job kwargs through the stdlib logger, and from Iteration 02 those
-kwargs carry WhatsApp message bodies. A structlog-only redaction chain would miss them
-entirely.
+looks: Procrastinate logs job kwargs through the stdlib logger, so a message body passed as a
+kwarg (which docs/adr/0001 forbids) would reach a log line that a structlog-only redaction
+chain never sees.
 """
 
 from __future__ import annotations

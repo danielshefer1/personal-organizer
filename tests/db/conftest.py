@@ -68,3 +68,21 @@ async def owner_conn(db_settings: Settings) -> AsyncIterator[Any]:
         yield conn
     finally:
         await conn.close()
+
+
+#: Everything a messaging test writes. The queue is included because ingress defers into it.
+_CHANNEL_TABLES = "channel_outbox, channel_inbox, procrastinate_jobs"
+
+
+@pytest.fixture
+async def clean_channel_tables(owner_conn: Any) -> AsyncIterator[None]:
+    """Empty the messaging ledgers and the queue before and after a test.
+
+    Opt-in rather than autouse: most DB tests touch no data. TRUNCATE is also why these
+    tests must never point at a deployed database -- see docker-compose.yml.
+    """
+    await owner_conn.execute(f"TRUNCATE {_CHANNEL_TABLES} CASCADE")
+    try:
+        yield
+    finally:
+        await owner_conn.execute(f"TRUNCATE {_CHANNEL_TABLES} CASCADE")

@@ -85,13 +85,20 @@ async def test_the_downgrade_round_trips(owner_conn: Any) -> None:
             "functions": [],
             "types": [],
         }
+        assert await _channel_tables(owner_conn) == []
         command.upgrade(config, "head")
         restored = await _surviving_objects(owner_conn)
         assert "procrastinate_jobs" in restored["tables"]
         assert "procrastinate_workers" in restored["tables"]
         assert "procrastinate_job_status" in restored["types"]
+        assert await _channel_tables(owner_conn) == ["channel_inbox", "channel_outbox"]
     finally:
         command.upgrade(config, "head")
+
+
+async def _channel_tables(conn: Any) -> list[str]:
+    rows = await conn.fetch(_TABLES_SQL + " ORDER BY tablename", "channel_%")
+    return [row["name"] for row in rows]
 
 
 async def test_procrastinate_tables_are_owned_by_the_owner_role(app_conn: Any) -> None:

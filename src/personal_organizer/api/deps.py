@@ -15,6 +15,8 @@ import procrastinate
 from fastapi import Depends, Request
 
 from personal_organizer.db.engine import Database
+from personal_organizer.interfaces.channel import InboundChannel
+from personal_organizer.messaging.ingress import IngressStore
 from personal_organizer.settings import Settings
 
 
@@ -33,15 +35,31 @@ def get_app_settings(request: Request) -> Settings:
     return settings
 
 
+def get_ingress_store(request: Request) -> IngressStore:
+    store: IngressStore = request.app.state.ingress_store
+    return store
+
+
+def get_inbound_channel(request: Request) -> InboundChannel:
+    channel: InboundChannel = request.app.state.inbound_channel
+    return channel
+
+
 DbDep = Annotated[Database, Depends(get_db)]
 ProcrastinateDep = Annotated[procrastinate.App, Depends(get_procrastinate)]
 SettingsDep = Annotated[Settings, Depends(get_app_settings)]
+IngressStoreDep = Annotated[IngressStore, Depends(get_ingress_store)]
+InboundChannelDep = Annotated[InboundChannel, Depends(get_inbound_channel)]
 
 __all__ = [
     "DbDep",
+    "InboundChannelDep",
+    "IngressStoreDep",
     "ProcrastinateDep",
     "SettingsDep",
     "get_app_settings",
     "get_db",
+    "get_inbound_channel",
+    "get_ingress_store",
     "get_procrastinate",
 ]

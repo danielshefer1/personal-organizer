@@ -1,0 +1,40 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "102290129340398",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "15550783881",
+              "phone_number_id": "106540352242922"
+            },
+            "contacts": [
+              {
+                "profile": {
+                  "name": "Daniel"
+                },
+                "wa_id": "31612345678"
+              }
+            ],
+            "messages": [
+              {
+                "from": "31612345678",
+                "id": "wamid.REACT1",
+                "timestamp": "1790000000",
+                "type": "reaction",
+                "reaction": {
+                  "message_id": "wamid.OURMSG1",
+                  "emoji": "👍"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

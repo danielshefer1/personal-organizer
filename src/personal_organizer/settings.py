@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from personal_organizer.core.errors import MissingDatabaseRoleError
+from personal_organizer.core.phone import normalise_e164
 from personal_organizer.db.roles import DatabaseRole
 
 Environment = Literal["local", "ci", "staging", "production"]
@@ -128,6 +129,79 @@ class WorkerSettings(BaseModel):
     pool_max_size: int = 4
 
 
+#: The verify token rides in a query string (``?hub.verify_token=``), which is the one place
+#: a secret can reach Sentry's request URL. At this length the ``_LONG_TOKEN`` scrubber
+#: recognises it everywhere, so the floor is what keeps it out of logs -- not a nicety.
+MIN_VERIFY_TOKEN_LENGTH: Final = 32
+
+
+class WhatsAppSettings(BaseModel):
+    """Meta's WhatsApp Cloud API.
+
+    Off by default, and all-or-nothing when on. The explicit flag is the point: inferring
+    "enabled" from whichever secrets happen to be present turns a forgotten
+    ``WHATSAPP__APP_SECRET`` into a webhook that silently is not there, instead of a service
+    that refuses to boot and names the missing variable. Disabled, the webhook router is not
+    mounted at all, so nothing accepts unsigned input while the credentials do not exist yet.
+    """
+
+    enabled: bool = False
+    #: HMAC key for ``X-Hub-Signature-256`` -- App settings -> Basic -> App secret. api only.
+    app_secret: SecretStr | None = None
+    #: Chosen by us, typed into Meta's webhook form, echoed back on the GET handshake. api only.
+    verify_token: SecretStr | None = None
+    #: Graph API bearer token (a System User token; the dashboard's expires in 24h). worker only.
+    access_token: SecretStr | None = None
+    #: The sending number's id -- not the number itself. worker only.
+    phone_number_id: str | None = None
+    graph_api_version: str = "v24.0"
+    graph_base_url: str = "https://graph.facebook.com"
+    send_timeout_s: float = 10.0
+    #: Comma-separated E.164 numbers. A ``str`` rather than ``list[str]`` because
+    #: pydantic-settings JSON-decodes list fields from the environment, and a plain
+    #: comma-separated value is not JSON. Replaced by ``tenant_identities`` in Iteration 03.
+    allowed_phones: str = ""
+
+    @property
+    def allowlist(self) -> frozenset[str]:
+        """The allowlist, normalised. The validator guarantees every entry normalises."""
+        return frozenset(
+            phone for entry in self._allowlist_entries() if (phone := normalise_e164(entry))
+        )
+
+    def _allowlist_entries(self) -> list[str]:
+        return [entry.strip() for entry in self.allowed_phones.split(",") if entry.strip()]
+
+    @model_validator(mode="after")
+    def _all_or_nothing(self) -> WhatsAppSettings:
+        problems: list[str] = []
+        if self.enabled:
+            required = {
+                "WHATSAPP__APP_SECRET": self.app_secret,
+                "WHATSAPP__VERIFY_TOKEN": self.verify_token,
+                "WHATSAPP__ACCESS_TOKEN": self.access_token,
+                "WHATSAPP__PHONE_NUMBER_ID": self.phone_number_id,
+            }
+            missing = [name for name, value in required.items() if not value]
+            if missing:
+                problems.append(f"{', '.join(missing)} required when WHATSAPP__ENABLED is true")
+        token = self.verify_token.get_secret_value() if self.verify_token else None
+        if token is not None and len(token) < MIN_VERIFY_TOKEN_LENGTH:
+            problems.append(
+                f"WHATSAPP__VERIFY_TOKEN must be at least {MIN_VERIFY_TOKEN_LENGTH} characters"
+            )
+        # Counted, never echoed: an entry that fails to parse is still somebody's number.
+        invalid = sum(1 for entry in self._allowlist_entries() if normalise_e164(entry) is None)
+        if invalid:
+            problems.append(
+                f"WHATSAPP__ALLOWED_PHONES has {invalid} entries that are not E.164 numbers"
+            )
+        if problems:
+            msg = "Invalid WhatsApp settings: " + "; ".join(problems)
+            raise ValueError(msg)
+        return self
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -135,6 +209,10 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
         extra="ignore",
         frozen=True,
+        # A ValidationError otherwise repeats the offending input -- here DSNs, tokens and the
+        # WhatsApp allowlist's phone numbers -- and a boot failure is printed to the deploy log.
+        # The messages name the variable, which is all an operator needs.
+        hide_input_in_errors=True,
     )
 
     app: AppSettings = AppSettings()
@@ -144,6 +222,7 @@ class Settings(BaseSettings):
     langfuse: LangfuseSettings = LangfuseSettings()
     models: ModelSettings
     worker: WorkerSettings = WorkerSettings()
+    whatsapp: WhatsAppSettings = WhatsAppSettings()
     flags: dict[str, bool] = Field(default_factory=dict)
 
     @property
@@ -193,6 +272,9 @@ class Settings(BaseSettings):
         # public URL. Refusing to boot without a token is what keeps it from being open.
         if self.app.env == "staging" and self.app.internal_token is None:
             problems.append("APP__INTERNAL_TOKEN is required in staging (/internal is mounted)")
+        # The access token is sent as a bearer header to this URL on every reply.
+        if self.whatsapp.enabled and not self.whatsapp.graph_base_url.startswith("https://"):
+            problems.append("WHATSAPP__GRAPH_BASE_URL must be https:// when deployed")
         if problems:
             msg = "Invalid settings for a deployed environment: " + "; ".join(problems)
             raise ValueError(msg)
@@ -212,6 +294,7 @@ __all__ = [
     "ModelSettings",
     "SentrySettings",
     "Settings",
+    "WhatsAppSettings",
     "WorkerSettings",
     "get_settings",
 ]

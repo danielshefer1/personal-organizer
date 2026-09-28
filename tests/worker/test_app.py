@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import procrastinate
+
+from personal_organizer.core.errors import (
+    AmbiguousDeliveryError,
+    RejectedChannelError,
+    TransientChannelError,
+)
 from personal_organizer.settings import Settings
 from personal_organizer.worker.app import build_procrastinate_app
 from personal_organizer.worker.queues import Queue
-from personal_organizer.worker.tasks.system import PING_TASK
+from personal_organizer.worker.tasks.channel import HANDLE_INBOUND_TASK
+from personal_organizer.worker.tasks.system import PING_TASK, RETRY_STALLED_TASK
 
 
 class TestProcrastinateApp:
@@ -46,3 +54,37 @@ class TestQueues:
         silently: the api still returns 200 {"deferred": true} and no worker ever runs it."""
         app = build_procrastinate_app(settings)
         assert app.tasks[PING_TASK].queue in settings.worker.queues
+
+
+class TestChannelTasks:
+    def test_the_inbound_task_is_on_the_webhooks_queue(self, settings: Settings) -> None:
+        app = build_procrastinate_app(settings)
+        assert app.tasks[HANDLE_INBOUND_TASK].queue == Queue.WEBHOOKS.value
+
+    def test_the_worker_subscribes_to_it_by_default(self, settings: Settings) -> None:
+        """Otherwise the webhook answers 200 and nothing ever processes the message."""
+        app = build_procrastinate_app(settings)
+        assert app.tasks[HANDLE_INBOUND_TASK].queue in settings.worker.queues
+
+    def test_only_definitely_unsent_failures_are_retried(self, settings: Settings) -> None:
+        """An ambiguous or rejected send must never be retried -- see docs/adr/0003."""
+        strategy = build_procrastinate_app(settings).tasks[HANDLE_INBOUND_TASK].retry_strategy
+        assert isinstance(strategy, procrastinate.RetryStrategy)
+        assert TransientChannelError in (strategy.retry_exceptions or set())
+        assert AmbiguousDeliveryError not in (strategy.retry_exceptions or set())
+        assert not any(
+            issubclass(RejectedChannelError, exc) for exc in strategy.retry_exceptions or set()
+        )
+
+
+class TestStalledJobRecovery:
+    def test_it_runs_every_minute(self, settings: Settings) -> None:
+        """A job killed mid-run by a deploy holds its sender's lock until this retries it."""
+        app = build_procrastinate_app(settings)
+        periodic = app.periodic_registry.periodic_tasks[(RETRY_STALLED_TASK, "")]
+        assert periodic.cron == "* * * * *"
+        assert app.tasks[RETRY_STALLED_TASK].queue in settings.worker.queues
+
+    def test_runs_never_pile_up(self, settings: Settings) -> None:
+        app = build_procrastinate_app(settings)
+        assert app.tasks[RETRY_STALLED_TASK].queueing_lock == RETRY_STALLED_TASK

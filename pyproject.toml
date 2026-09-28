@@ -41,6 +41,7 @@ dependencies = [
 [project.scripts]
 po-db = "personal_organizer.db.cli:main"
 po-worker = "personal_organizer.worker.main:main"
+po-whatsapp = "personal_organizer.providers.channel.whatsapp.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]

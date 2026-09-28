@@ -1,18 +1,22 @@
 # personal-organizer
 
 A WhatsApp AI personal organizer: calendar, reminders and long-term memory, reachable over
-WhatsApp. This repository is the implementation of the v7 plan; **Iteration 01 (walking
-skeleton)** is what currently exists.
+WhatsApp. This repository is the implementation of the v7 plan. **Iteration 01 (walking
+skeleton)** and **Iteration 02 (WhatsApp webhook, queue and access controls)** exist: an
+allowlisted sender gets a fixed acknowledgement, everyone else a one-line "invite-only"
+reply. There is no agent yet.
 
 ## What is here
 
 | | |
 |---|---|
-| `src/personal_organizer/api/` | FastAPI service. `/health` (liveness), `/ready` (readiness, monitoring only). |
+| `src/personal_organizer/api/` | FastAPI service. `/health` (liveness), `/ready` (readiness, monitoring only), `/webhooks/whatsapp` (when enabled). |
 | `src/personal_organizer/worker/` | Procrastinate worker and task registry. |
-| `src/personal_organizer/db/` | Async engines per role, tenant-scoped sessions, bootstrap, `po-db`. |
+| `src/personal_organizer/db/` | Async engines per role, tenant-scoped sessions, bootstrap, `po-db`, ORM models. |
+| `src/personal_organizer/messaging/` | Provider-neutral ingress (persist-then-ack), the access-control gate, at-most-once replies. |
+| `src/personal_organizer/providers/channel/whatsapp/` | Meta Cloud API: signature, payload parser, Graph sends, `po-whatsapp`. |
 | `src/personal_organizer/observability/` | structlog + PII redaction, Sentry, Langfuse. |
-| `src/personal_organizer/interfaces/` | `LLMProvider`, `CalendarProvider`, `MemoryStore`, `Channel`, `TasksProvider`, `ExportService`. |
+| `src/personal_organizer/interfaces/` | `LLMProvider`, `CalendarProvider`, `MemoryStore`, `InboundChannel`/`OutboundChannel`, `TasksProvider`, `ExportService`. |
 | `alembic/` | Migrations, `bootstrap.sql`, vendored Procrastinate schema. |
 | `docs/adr/` | Decisions that are not obvious from the code. |
 | `scripts/promote` | Fast-forwards `production` onto a green commit of `main`. |
@@ -49,6 +53,21 @@ Then prove the skeleton end to end — api, database, queue, worker:
 curl -X POST -H "X-Internal-Token: local-dev-internal-token" \
   localhost:8000/internal/ping               # worker logs {"event": "ping.ok", ...}
 ```
+
+### WhatsApp without a Meta app
+
+Set `WHATSAPP__ENABLED=true` in `.env` with self-made credentials (the block at the bottom of
+`.env.example`), allowlist your own number, restart both services, and play Meta:
+
+```sh
+uv run po-whatsapp simulate --url http://localhost:8000/webhooks/whatsapp \
+  --from +31612345678 --replay 10         # ten POSTs, one inbox row, one job
+```
+
+The worker then tries to reply through the Graph API and, with a made-up token, logs
+`whatsapp.graph_error error_code: 190` — expected. Point `WHATSAPP__GRAPH_BASE_URL` at a
+local stub to see the whole happy path. Connecting a real Meta app is
+`docs/runbook-iteration-02.md`.
 
 ### The local database holds nothing real
 
@@ -96,3 +115,7 @@ staging only) `APP__INTERNAL_TOKEN`, so the Sentry project has to exist before t
 `APP__ENV` is the one to get right first, because every check in that list is gated on it and
 it defaults to `local`. Omitting it used to switch all of them off in silence rather than
 failing; a deployed container that does not declare its environment now refuses to start.
+
+WhatsApp is off unless `WHATSAPP__ENABLED=true`, and then all four of its credentials are
+required. Connecting it — Meta app, test number, webhook registration, and what each failure
+looks like — is `docs/runbook-iteration-02.md`.

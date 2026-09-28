@@ -35,6 +35,12 @@ def require_internal_token(request: Request) -> None:
     When no token is configured the endpoint stays open, but only outside a deployed
     environment -- the settings validator makes that combination unreachable on staging, so
     this is the second guard rather than the only one.
+
+    Note what that leans on: ``is_deployed``, which is ``APP__ENV``. A deployed service with
+    that variable unset used to satisfy *both* guards at once -- the router mounted because
+    the env was not ``"production"``, and this check waved it through because the env was not
+    deployed either. ``Settings`` now refuses to construct in that state, which is what makes
+    the pair of guards independent rather than two readings of the same variable.
     """
     settings = get_app_settings(request)
     expected = settings.app.internal_token

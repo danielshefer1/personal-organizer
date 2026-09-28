@@ -88,7 +88,11 @@ enabled for a service created after 2026-08-28, so the start command lives in th
 `CMD` (dispatching on `APP__COMPONENT`) and the api's pre-deploy command and healthcheck path
 are set per service in the dashboard.
 
-Setting an environment up the first time — every variable, and the three ways it bites if you
-miss one — is `docs/runbook-iteration-01.md`. The short version: a deployed service **refuses to
+Setting an environment up the first time — every variable, and the ways it bites if you miss
+one — is `docs/runbook-iteration-01.md`. The short version: a deployed service **refuses to
 boot** without `SENTRY__DSN`, a real `LOGGING__PII_PEPPER`, `DATABASE__OWNER_URL`, and (in
 staging only) `APP__INTERNAL_TOKEN`, so the Sentry project has to exist before the first deploy.
+
+`APP__ENV` is the one to get right first, because every check in that list is gated on it and
+it defaults to `local`. Omitting it used to switch all of them off in silence rather than
+failing; a deployed container that does not declare its environment now refuses to start.

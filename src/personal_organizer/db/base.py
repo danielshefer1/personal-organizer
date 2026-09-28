@@ -7,9 +7,11 @@ produce the same names every time or those migrations drift.
 
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Any, ClassVar
 from uuid import UUID
 
-from sqlalchemy import MetaData
+from sqlalchemy import DateTime, MetaData
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 NAMING_CONVENTION = {
@@ -23,6 +25,9 @@ NAMING_CONVENTION = {
 
 class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
+    # Every timestamp is timestamptz. A naive column plus a server in one zone and a worker
+    # in another is how "remind me at 9" fires at 7; there is no column where that is wanted.
+    type_annotation_map: ClassVar[dict[Any, Any]] = {datetime: DateTime(timezone=True)}
 
 
 class TenantMixin:

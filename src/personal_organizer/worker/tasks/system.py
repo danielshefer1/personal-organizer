@@ -25,6 +25,7 @@ from personal_organizer.worker.queues import Queue
 log = structlog.get_logger(__name__)
 
 PING_TASK = "system:ping"
+RETRY_STALLED_TASK = "system:retry_stalled_jobs"
 
 
 def register(app: procrastinate.App) -> None:
@@ -35,5 +36,32 @@ def register(app: procrastinate.App) -> None:
             await session.execute(text("SELECT 1"))
         log.info("ping.ok", job_id=context.job.id, queue=Queue.MAINTENANCE.value)
 
+    @app.periodic(cron="* * * * *")
+    @app.task(
+        queue=Queue.MAINTENANCE.value,
+        name=RETRY_STALLED_TASK,
+        queueing_lock=RETRY_STALLED_TASK,
+        pass_context=True,
+    )
+    async def retry_stalled_jobs(
+        context: procrastinate.JobContext,
+        timestamp: int,  # noqa: ARG001 - periodic tasks receive their schedule time
+    ) -> None:
+        """Put jobs whose worker died back in the queue.
 
-__all__ = ["PING_TASK", "register"]
+        Nothing else does, and every merge to ``main`` redeploys staging, killing whatever
+        was mid-run. Such a job stays ``doing`` forever -- and an inbound message job holds
+        its sender's lock while it does, so everything that sender sends afterwards queues
+        behind it and is never processed. Stalled means the worker stopped heartbeating,
+        not merely that the job is slow. Retrying a reply mid-send is safe: see
+        ``messaging.outbox``.
+        """
+        manager = context.app.job_manager
+        for job in await manager.get_stalled_jobs():
+            await manager.retry_job(job)
+            log.warning(
+                "job.stalled_retried", job_id=job.id, task_name=job.task_name, queue=job.queue
+            )
+
+
+__all__ = ["PING_TASK", "RETRY_STALLED_TASK", "register"]

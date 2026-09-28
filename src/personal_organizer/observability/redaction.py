@@ -80,6 +80,11 @@ HASH_KEYS: Final = frozenset(
         "attendee_email",
         "from_",
         "to",
+        # A WhatsApp message id is not a secret, but it is not opaque either: ``wamid.HBgL...``
+        # is base64 over a structure that embeds the counterpart's phone number. Log the
+        # inbox row's UUID to correlate, and let these hash if they are logged at all.
+        "wamid",
+        "provider_message_id",
     }
 )
 
@@ -141,6 +146,21 @@ SAFE_KEYS: Final = frozenset(
         "attempt",
         "priority",
         "lock",
+        # messaging -- our own row ids, provider-neutral enums and counts. Never the
+        # provider's message id (see HASH_KEYS) and never the sender (hashed as ``sender``).
+        "channel",
+        "inbox_id",
+        "outbox_id",
+        "message_type",
+        "delivery_status",
+        "disposition",
+        "reason",
+        "message_count",
+        "status_count",
+        "duplicate_count",
+        "skipped_count",
+        "whatsapp_enabled",
+        "allowlist_size",
         # db -- infrastructure coordinates, so that a connection failure says which host it
         # could not reach. The password lives in the DSN and never in these.
         "db_role",
@@ -185,6 +205,10 @@ OPAQUE_ID_KEYS: Final = frozenset(
         "session_id_hash",
         "client_ip_hash",
         "release",
+        # Our own UUIDs for inbox and outbox rows: the handle a messaging log line carries
+        # instead of the provider's message id.
+        "inbox_id",
+        "outbox_id",
     }
 )
 

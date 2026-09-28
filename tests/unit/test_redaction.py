@@ -155,6 +155,27 @@ class TestHashing:
     def test_pepper_changes_the_hash(self) -> None:
         assert hash_identifier("x", "p1") != hash_identifier("x", "p2")
 
+    @pytest.mark.parametrize("key", ["wamid", "provider_message_id"])
+    def test_whatsapp_message_ids_are_hashed_not_logged(self, key: str) -> None:
+        """A wamid is base64 over a structure embedding the counterpart's number."""
+        wamid = "wamid.HBgLMzE2MTIzNDU2NzgVAgASGBQzQTdEMEY1QjQ1RjE4NjhBMUUwRQA="
+        out = redact_event({key: wamid}, pepper="p")
+        assert key not in out
+        assert out[f"{key}_hash"] == hash_identifier(wamid, "p")
+
+
+class TestMessagingKeys:
+    def test_inbox_row_ids_survive_as_correlation_handles(self) -> None:
+        inbox_id, outbox_id = str(uuid4()), str(uuid4())
+        out = redact_event({"inbox_id": inbox_id, "outbox_id": outbox_id}, pepper="p")
+        assert out == {"inbox_id": inbox_id, "outbox_id": outbox_id}
+
+    def test_a_webhook_verify_token_in_a_url_is_scrubbed(self) -> None:
+        """The settings floor of 32 characters is what makes this true."""
+        token = "a3f1" * 16
+        url = f"/webhooks/whatsapp?hub.mode=subscribe&hub.verify_token={token}&hub.challenge=1"
+        assert token not in scrub_text(url)
+
 
 class TestUnredactedEscapeHatch:
     def test_ignored_by_default(self) -> None:

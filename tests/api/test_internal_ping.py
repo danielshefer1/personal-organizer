@@ -88,6 +88,19 @@ class TestTokenGate:
         assert response.status_code == 404
         assert token_app.state.procrastinate.deferred == []
 
+    async def test_a_non_ascii_token_is_404_not_500(
+        self, token_app: FastAPI, make_client: Callable[[FastAPI], Any]
+    ) -> None:
+        """``compare_digest`` raises TypeError on non-ASCII ``str``; headers arrive latin-1
+        decoded, so the comparison has to happen on bytes."""
+        async with make_client(token_app) as client:
+            response = await client.post(
+                "/internal/ping", headers={INTERNAL_TOKEN_HEADER: "caf\xe9".encode("latin-1")}
+            )
+
+        assert response.status_code == 404
+        assert token_app.state.procrastinate.deferred == []
+
     async def test_the_endpoint_is_open_locally_with_no_token_configured(
         self, settings_factory: Callable[..., Settings], make_client: Callable[[FastAPI], Any]
     ) -> None:

@@ -109,6 +109,107 @@ class TestDeployedInvariants:
         assert not cfg.is_deployed
 
 
+VERIFY_TOKEN = "v" * 64
+
+_WHATSAPP_CREDENTIALS = {
+    "WHATSAPP__APP_SECRET": "app-secret",
+    "WHATSAPP__VERIFY_TOKEN": VERIFY_TOKEN,
+    "WHATSAPP__ACCESS_TOKEN": "graph-token",
+    "WHATSAPP__PHONE_NUMBER_ID": "1234567890",
+}
+
+_DEPLOYED = {
+    "SENTRY__DSN": "https://k@o.ingest.sentry.io/1",
+    "LOGGING__PII_PEPPER": "a-real-secret",
+    "APP__INTERNAL_TOKEN": "t",
+}
+
+
+class TestWhatsApp:
+    """Off by default and all-or-nothing when on, so that staging can deploy before the Meta
+    app exists and a half-configured channel refuses to boot rather than half-working."""
+
+    def test_disabled_by_default_with_nothing_required(self, settings: Settings) -> None:
+        assert settings.whatsapp.enabled is False
+        assert settings.whatsapp.app_secret is None
+
+    @pytest.mark.parametrize("env", ["staging", "production"])
+    def test_a_deployed_service_boots_with_whatsapp_disabled(
+        self, settings_factory: Any, env: str
+    ) -> None:
+        """What lets Iteration 02 merge and deploy before the Meta credentials exist."""
+        cfg = settings_factory(APP__ENV=env, **_DEPLOYED)
+        assert cfg.is_deployed
+        assert not cfg.whatsapp.enabled
+
+    def test_enabled_with_nothing_names_every_missing_credential_at_once(
+        self, settings_factory: Any
+    ) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            settings_factory(WHATSAPP__ENABLED="true")
+        message = str(excinfo.value)
+        for name in _WHATSAPP_CREDENTIALS:
+            assert name in message
+
+    def test_enabled_with_every_credential_boots(self, settings_factory: Any) -> None:
+        cfg = settings_factory(WHATSAPP__ENABLED="true", **_WHATSAPP_CREDENTIALS)
+        assert cfg.whatsapp.enabled
+        assert cfg.whatsapp.phone_number_id == "1234567890"
+
+    def test_enabled_in_staging_boots(self, settings_factory: Any) -> None:
+        cfg = settings_factory(
+            APP__ENV="staging", WHATSAPP__ENABLED="true", **_DEPLOYED, **_WHATSAPP_CREDENTIALS
+        )
+        assert cfg.whatsapp.enabled
+
+    def test_a_short_verify_token_is_rejected(self, settings_factory: Any) -> None:
+        """It travels in a query string; below 32 characters the token scrubber misses it."""
+        with pytest.raises(ValidationError, match="VERIFY_TOKEN"):
+            settings_factory(WHATSAPP__VERIFY_TOKEN="short")
+
+    def test_plain_http_graph_url_is_rejected_when_deployed(self, settings_factory: Any) -> None:
+        """The bearer token goes to this URL on every reply."""
+        with pytest.raises(ValidationError, match="GRAPH_BASE_URL"):
+            settings_factory(
+                APP__ENV="production",
+                WHATSAPP__ENABLED="true",
+                WHATSAPP__GRAPH_BASE_URL="http://graph.facebook.com",
+                **_DEPLOYED,
+                **_WHATSAPP_CREDENTIALS,
+            )
+
+    def test_the_allowlist_is_comma_separated_and_normalised(self, settings_factory: Any) -> None:
+        cfg = settings_factory(WHATSAPP__ALLOWED_PHONES=" +31 6 1234 5678, 0044 7700 900123 ,")
+        assert cfg.whatsapp.allowlist == frozenset({"+31612345678", "+447700900123"})
+
+    def test_an_invalid_allowlist_entry_fails_boot_without_echoing_it(
+        self, settings_factory: Any
+    ) -> None:
+        """Silently dropping a typo'd number would leave its owner locked out with no
+        explanation; echoing it would put a phone number in the deploy log."""
+        with pytest.raises(ValidationError, match="ALLOWED_PHONES") as excinfo:
+            settings_factory(WHATSAPP__ALLOWED_PHONES="+31612345678,0612345678")
+        assert "0612345678" not in str(excinfo.value)
+        assert "31612345678" not in str(excinfo.value)
+
+    def test_a_boot_failure_never_repeats_a_secret(self, settings_factory: Any) -> None:
+        """Pydantic echoes the input in its error by default, and boot failures are printed
+        straight into the platform's deploy log."""
+        with pytest.raises(ValidationError) as excinfo:
+            settings_factory(APP__ENV="production", LOGGING__PII_PEPPER="a-real-secret")
+        assert "a-real-secret" not in str(excinfo.value)
+        assert "pw@localhost" not in str(excinfo.value)
+
+    def test_an_empty_allowlist_is_empty(self, settings: Settings) -> None:
+        assert settings.whatsapp.allowlist == frozenset()
+
+    def test_credentials_never_render(self, settings_factory: Any) -> None:
+        cfg = settings_factory(WHATSAPP__ENABLED="true", **_WHATSAPP_CREDENTIALS)
+        rendered = repr(cfg) + cfg.model_dump_json()
+        for secret in ("app-secret", VERIFY_TOKEN, "graph-token"):
+            assert secret not in rendered
+
+
 class TestThePlatformGuard:
     """`APP__ENV` is what every other check is gated on, so it cannot be optional.
 

@@ -19,8 +19,9 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from typing import Final, Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from personal_organizer.core.errors import MissingDatabaseRoleError
@@ -32,6 +33,9 @@ Component = Literal["api", "worker", "cli"]
 
 #: Placeholder pepper; rejected by the validator outside local/ci.
 _DEV_PEPPER = "local-dev-pepper-not-secret"
+
+#: Placeholder link secret from ``.env.example``; rejected by the validator outside local/ci.
+_DEV_LINK_SECRET = "local-dev-link-secret-not-a-secret-0000"  # noqa: S105 - a known placeholder
 
 #: Railway injects its own variables into every container it runs. Their presence is proof
 #: of being deployed that does not depend on anyone remembering to say so.
@@ -53,6 +57,28 @@ class AppSettings(BaseModel):
     #: Shared secret for the ``/internal`` router. That router is mounted whenever ``env`` is not
     #: ``production``, so on staging it is publicly reachable and enqueues work per call.
     internal_token: SecretStr | None = None
+    #: The origin users' browsers reach the api at -- where onboarding links point and where
+    #: Composio sends them back to, e.g. ``https://staging.example.com``. An origin and nothing
+    #: more, so building a URL is concatenation. Required when ``COMPOSIO__ENABLED``.
+    public_base_url: str | None = None
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _origin_only(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        parts = urlsplit(value.strip())
+        if (
+            parts.scheme not in ("http", "https")
+            or not parts.hostname
+            or parts.username is not None
+            or parts.path not in ("", "/")
+            or parts.query
+            or parts.fragment
+        ):
+            msg = "APP__PUBLIC_BASE_URL must be an origin such as https://example.com, no path"
+            raise ValueError(msg)
+        return f"{parts.scheme}://{parts.netloc}"
 
 
 class DatabaseSettings(BaseModel):
@@ -159,7 +185,8 @@ class WhatsAppSettings(BaseModel):
     send_timeout_s: float = 10.0
     #: Comma-separated E.164 numbers. A ``str`` rather than ``list[str]`` because
     #: pydantic-settings JSON-decodes list fields from the environment, and a plain
-    #: comma-separated value is not JSON. Replaced by ``tenant_identities`` in Iteration 03.
+    #: comma-separated value is not JSON. From Iteration 03 this is the *invite* list: a number
+    #: on it may start onboarding, and ``tenant_identities`` records who actually has.
     allowed_phones: str = ""
 
     @property
@@ -202,6 +229,63 @@ class WhatsAppSettings(BaseModel):
         return self
 
 
+#: Composio's id prefix for an auth config. A connected account id (``ca_``) or a toolkit
+#: slug pasted in its place would otherwise surface as a failure at the first onboarding.
+AUTH_CONFIG_PREFIX: Final = "ac_"
+
+
+class ComposioSettings(BaseModel):
+    """Composio, which holds users' Google tokens so that we never do (v7 Section 3).
+
+    Off by default and all-or-nothing when on, like WhatsApp. Enabled, the api serves the
+    connect pages and Composio's callback, so it also needs ``APP__PUBLIC_BASE_URL`` and
+    ``ONBOARDING__LINK_SECRET`` -- which live in other sections, so ``Settings`` checks all
+    four together and names every missing one at once.
+    """
+
+    enabled: bool = False
+    api_key: SecretStr | None = None
+    #: The auth config *new* connections are made under: Composio's managed Google Calendar
+    #: config until the Section 3.3 cutover, ours after it. Every connection row records the
+    #: config that made it, so changing this never breaks an existing connection.
+    calendar_auth_config_id: str | None = None
+    request_timeout_s: float = 15.0
+
+    @field_validator("calendar_auth_config_id")
+    @classmethod
+    def _looks_like_an_auth_config(cls, value: str | None) -> str | None:
+        if value is not None and not value.startswith(AUTH_CONFIG_PREFIX):
+            msg = (
+                "COMPOSIO__CALENDAR_AUTH_CONFIG_ID must be an auth config id "
+                f"({AUTH_CONFIG_PREFIX}...)"
+            )
+            raise ValueError(msg)
+        return value
+
+
+#: Links are signed with HMAC; a short secret can be brute-forced offline from one link.
+MIN_LINK_SECRET_LENGTH: Final = 32
+
+
+class OnboardingSettings(BaseModel):
+    """Signed links that take a user from WhatsApp to one of our pages and back."""
+
+    #: Signs onboarding links and the state Composio hands back to our callback. Rotating it
+    #: invalidates every outstanding link, which costs a user one fresh link; nothing else.
+    link_secret: SecretStr | None = None
+    #: Long enough to switch apps and sign in to Google; short enough that a forwarded
+    #: screenshot of the link has gone stale.
+    link_ttl_s: int = Field(default=900, ge=60, le=3600)
+
+    @model_validator(mode="after")
+    def _long_enough(self) -> OnboardingSettings:
+        secret = self.link_secret.get_secret_value() if self.link_secret else None
+        if secret is not None and len(secret) < MIN_LINK_SECRET_LENGTH:
+            msg = f"ONBOARDING__LINK_SECRET must be at least {MIN_LINK_SECRET_LENGTH} characters"
+            raise ValueError(msg)
+        return self
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -223,6 +307,8 @@ class Settings(BaseSettings):
     models: ModelSettings
     worker: WorkerSettings = WorkerSettings()
     whatsapp: WhatsAppSettings = WhatsAppSettings()
+    composio: ComposioSettings = ComposioSettings()
+    onboarding: OnboardingSettings = OnboardingSettings()
     flags: dict[str, bool] = Field(default_factory=dict)
 
     @property
@@ -235,6 +321,25 @@ class Settings(BaseSettings):
         if value is None:
             raise MissingDatabaseRoleError(role.value)
         return value.get_secret_value()
+
+    @model_validator(mode="after")
+    def _composio_is_complete(self) -> Settings:
+        if not self.composio.enabled:
+            return self
+        required = {
+            "COMPOSIO__API_KEY": self.composio.api_key,
+            "COMPOSIO__CALENDAR_AUTH_CONFIG_ID": self.composio.calendar_auth_config_id,
+            "APP__PUBLIC_BASE_URL": self.app.public_base_url,
+            "ONBOARDING__LINK_SECRET": self.onboarding.link_secret,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            msg = (
+                f"Invalid Composio settings: {', '.join(missing)} required when "
+                "COMPOSIO__ENABLED is true"
+            )
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _enforce_deployed_invariants(self) -> Settings:
@@ -275,6 +380,14 @@ class Settings(BaseSettings):
         # The access token is sent as a bearer header to this URL on every reply.
         if self.whatsapp.enabled and not self.whatsapp.graph_base_url.startswith("https://"):
             problems.append("WHATSAPP__GRAPH_BASE_URL must be https:// when deployed")
+        # Onboarding links carry a bearer token in their path, and Google will not complete
+        # an OAuth flow that returns to a plain-http page.
+        base_url = self.app.public_base_url
+        if base_url is not None and not base_url.startswith("https://"):
+            problems.append("APP__PUBLIC_BASE_URL must be https:// when deployed")
+        link_secret = self.onboarding.link_secret
+        if link_secret is not None and link_secret.get_secret_value() == _DEV_LINK_SECRET:
+            problems.append("ONBOARDING__LINK_SECRET must be set to a real secret when deployed")
         if problems:
             msg = "Invalid settings for a deployed environment: " + "; ".join(problems)
             raise ValueError(msg)
@@ -288,10 +401,12 @@ def get_settings() -> Settings:
 
 __all__ = [
     "AppSettings",
+    "ComposioSettings",
     "DatabaseSettings",
     "LangfuseSettings",
     "LoggingSettings",
     "ModelSettings",
+    "OnboardingSettings",
     "SentrySettings",
     "Settings",
     "WhatsAppSettings",

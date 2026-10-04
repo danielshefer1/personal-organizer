@@ -1,0 +1,15 @@
+{
+  "event": "message",
+  "device_id": "31600000001@s.whatsapp.net",
+  "payload": {
+    "id": "3EB0C127D7BACC83D6A5",
+    "chat_id": "31612345678@s.whatsapp.net",
+    "from": "31612345678@s.whatsapp.net",
+    "timestamp": "2026-09-21T14:18:00Z",
+    "body": "Location: 52.37, 4.89",
+    "location": {
+      "degrees_latitude": 52.37,
+      "degrees_longitude": 4.89
+    }
+  }
+}

@@ -25,3 +25,31 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # The GOWA WhatsApp gateway, for linking a real phone locally. Opt-in:
+  #   docker compose --profile gateway up -d gowa
+  # then open http://localhost:3000 (user po, password below) and scan the QR code from the
+  # bot's phone. Match the api's GOWA__* in .env: BASIC_AUTH_USER=po,
+  # BASIC_AUTH_PASSWORD=local-gowa-password, WEBHOOK_SECRET=<the secret below>.
+  # Its session -- a live login to that WhatsApp account -- and a copy of its chats sit in
+  # ./.gowa; docs/runbook-whatsapp-gateway.md has what each setting is for.
+  gowa:
+    image: aldinokemal2104/go-whatsapp-web-multidevice:v9.6.0
+    container_name: po-gowa
+    profiles: ["gateway"]
+    command: ["rest"]
+    environment:
+      APP_PORT: "3000"
+      APP_BASIC_AUTH: po:local-gowa-password
+      WHATSAPP_WEBHOOK: http://host.docker.internal:8000/webhooks/gowa
+      WHATSAPP_WEBHOOK_SECRET: local-gowa-webhook-secret-0123456789
+      WHATSAPP_WEBHOOK_EVENTS: message,message.ack
+      WHATSAPP_WEBHOOK_IGNORE_JIDS: "@g.us,@newsletter,status@broadcast"
+      WHATSAPP_AUTO_DOWNLOAD_MEDIA: "false"
+      MCP_ENABLED: "false"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./.gowa:/app/storages

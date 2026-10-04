@@ -186,7 +186,9 @@ class WhatsAppSettings(BaseModel):
     #: Comma-separated E.164 numbers. A ``str`` rather than ``list[str]`` because
     #: pydantic-settings JSON-decodes list fields from the environment, and a plain
     #: comma-separated value is not JSON. From Iteration 03 this is the *invite* list: a number
-    #: on it may start onboarding, and ``tenant_identities`` records who actually has.
+    #: on it may start onboarding, and ``tenant_identities`` records who actually has. It is
+    #: the invite list for every channel -- the GOWA gateway's too -- so it applies whether
+    #: or not ``WHATSAPP__ENABLED`` is.
     allowed_phones: str = ""
 
     @property
@@ -225,6 +227,79 @@ class WhatsAppSettings(BaseModel):
             )
         if problems:
             msg = "Invalid WhatsApp settings: " + "; ".join(problems)
+            raise ValueError(msg)
+        return self
+
+
+#: GOWA's webhook secret defaults to the literal ``secret``; the floor rules that out, and
+#: anything else an attacker could guess from the gateway's docs.
+MIN_GOWA_WEBHOOK_SECRET_LENGTH: Final = 32
+
+#: Railway's private network. Traffic on it never leaves the project, so plain http to a
+#: host here is not the exposure it would be on the internet.
+PRIVATE_NETWORK_SUFFIX: Final = ".railway.internal"
+
+
+class GowaSettings(BaseModel):
+    """The GOWA gateway (go-whatsapp-web-multidevice): WhatsApp through a linked device.
+
+    An unofficial alternative to Meta's Cloud API, linked by QR code to a dedicated SIM;
+    docs/adr/0004 has why, and what it risks. Off by default and all-or-nothing when on,
+    like ``WhatsAppSettings`` -- and independent of it: both may be on at once, each serving
+    its own number, and a reply goes out on whichever channel the message came in on.
+    """
+
+    enabled: bool = False
+    #: Where the worker reaches the gateway's REST API -- on Railway, its private hostname.
+    base_url: str = "http://localhost:3000"
+    #: The gateway's ``APP_BASIC_AUTH``. Required: its API can send as the linked number.
+    basic_auth_user: str | None = None
+    basic_auth_password: SecretStr | None = None
+    #: HMAC key for the webhook's ``X-Hub-Signature-256`` -- the gateway's
+    #: ``WHATSAPP_WEBHOOK_SECRET``. api only.
+    webhook_secret: SecretStr | None = None
+    #: Sent as ``X-Device-Id`` and matched against the webhook's ``session_id``. Only needed
+    #: when the gateway holds more than one device; with one, it is the default.
+    device_id: str | None = None
+    send_timeout_s: float = 10.0
+    #: A typing indicator this long precedes every reply. A linked device that answers in
+    #: milliseconds, every time, looks like what it is; a ban costs the number.
+    typing_delay_s: float = Field(default=1.5, ge=0.0, le=5.0)
+
+    @field_validator("base_url")
+    @classmethod
+    def _http_origin(cls, value: str) -> str:
+        parts = urlsplit(value.strip())
+        if parts.scheme not in ("http", "https") or not parts.hostname or parts.username:
+            msg = "GOWA__BASE_URL must be an http(s) URL such as http://gowa.railway.internal:3000"
+            raise ValueError(msg)
+        return value.strip().rstrip("/")
+
+    @property
+    def on_private_network(self) -> bool:
+        host = urlsplit(self.base_url).hostname or ""
+        return host.endswith(PRIVATE_NETWORK_SUFFIX)
+
+    @model_validator(mode="after")
+    def _all_or_nothing(self) -> GowaSettings:
+        problems: list[str] = []
+        if self.enabled:
+            required = {
+                "GOWA__BASIC_AUTH_USER": self.basic_auth_user,
+                "GOWA__BASIC_AUTH_PASSWORD": self.basic_auth_password,
+                "GOWA__WEBHOOK_SECRET": self.webhook_secret,
+            }
+            missing = [name for name, value in required.items() if not value]
+            if missing:
+                problems.append(f"{', '.join(missing)} required when GOWA__ENABLED is true")
+        secret = self.webhook_secret.get_secret_value() if self.webhook_secret else None
+        if secret is not None and len(secret) < MIN_GOWA_WEBHOOK_SECRET_LENGTH:
+            problems.append(
+                f"GOWA__WEBHOOK_SECRET must be at least {MIN_GOWA_WEBHOOK_SECRET_LENGTH} "
+                "characters (the gateway's default, 'secret', is not one)"
+            )
+        if problems:
+            msg = "Invalid GOWA settings: " + "; ".join(problems)
             raise ValueError(msg)
         return self
 
@@ -307,6 +382,7 @@ class Settings(BaseSettings):
     models: ModelSettings
     worker: WorkerSettings = WorkerSettings()
     whatsapp: WhatsAppSettings = WhatsAppSettings()
+    gowa: GowaSettings = GowaSettings()
     composio: ComposioSettings = ComposioSettings()
     onboarding: OnboardingSettings = OnboardingSettings()
     flags: dict[str, bool] = Field(default_factory=dict)
@@ -380,6 +456,13 @@ class Settings(BaseSettings):
         # The access token is sent as a bearer header to this URL on every reply.
         if self.whatsapp.enabled and not self.whatsapp.graph_base_url.startswith("https://"):
             problems.append("WHATSAPP__GRAPH_BASE_URL must be https:// when deployed")
+        # Basic-auth credentials ride on every send, so they go over TLS or stay inside
+        # Railway's private network -- never plain http across the internet.
+        gowa = self.gowa
+        if gowa.enabled and not (gowa.base_url.startswith("https://") or gowa.on_private_network):
+            problems.append(
+                f"GOWA__BASE_URL must be https:// or a *{PRIVATE_NETWORK_SUFFIX} host when deployed"
+            )
         # Onboarding links carry a bearer token in their path, and Google will not complete
         # an OAuth flow that returns to a plain-http page.
         base_url = self.app.public_base_url
@@ -403,6 +486,7 @@ __all__ = [
     "AppSettings",
     "ComposioSettings",
     "DatabaseSettings",
+    "GowaSettings",
     "LangfuseSettings",
     "LoggingSettings",
     "ModelSettings",

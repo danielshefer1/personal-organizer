@@ -210,6 +210,99 @@ class TestWhatsApp:
             assert secret not in rendered
 
 
+GOWA_WEBHOOK_SECRET = "g" * 40
+
+_GOWA_CREDENTIALS = {
+    "GOWA__BASIC_AUTH_USER": "po",
+    "GOWA__BASIC_AUTH_PASSWORD": "gateway-password",
+    "GOWA__WEBHOOK_SECRET": GOWA_WEBHOOK_SECRET,
+}
+
+
+class TestGowa:
+    """The QR-code gateway: off by default, all-or-nothing when on, independent of Meta."""
+
+    def test_disabled_by_default_with_nothing_required(self, settings: Settings) -> None:
+        assert settings.gowa.enabled is False
+        assert settings.gowa.webhook_secret is None
+
+    def test_enabled_with_nothing_names_every_missing_credential_at_once(
+        self, settings_factory: Any
+    ) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            settings_factory(GOWA__ENABLED="true")
+        message = str(excinfo.value)
+        for name in _GOWA_CREDENTIALS:
+            assert name in message
+
+    def test_enabled_with_every_credential_boots(self, settings_factory: Any) -> None:
+        cfg = settings_factory(
+            GOWA__ENABLED="true", GOWA__BASE_URL="http://gowa:3000/", **_GOWA_CREDENTIALS
+        )
+        assert cfg.gowa.enabled
+        assert cfg.gowa.base_url == "http://gowa:3000"
+
+    @pytest.mark.parametrize("secret", ["secret", "short-but-not-the-default"])
+    def test_a_guessable_webhook_secret_is_rejected(
+        self, settings_factory: Any, secret: str
+    ) -> None:
+        """``secret`` is the gateway's documented default."""
+        with pytest.raises(ValidationError, match="GOWA__WEBHOOK_SECRET") as excinfo:
+            settings_factory(GOWA__WEBHOOK_SECRET=secret)
+        assert "short-but-not-the-default" not in str(excinfo.value)
+
+    def test_both_whatsapp_providers_may_run_at_once(self, settings_factory: Any) -> None:
+        cfg = settings_factory(
+            WHATSAPP__ENABLED="true",
+            GOWA__ENABLED="true",
+            **_WHATSAPP_CREDENTIALS,
+            **_GOWA_CREDENTIALS,
+        )
+        assert cfg.whatsapp.enabled
+        assert cfg.gowa.enabled
+
+    @pytest.mark.parametrize(
+        "url", ["http://gowa.railway.internal:3000", "https://gowa.example.com"]
+    )
+    def test_deployed_base_url_is_private_or_tls(self, settings_factory: Any, url: str) -> None:
+        cfg = settings_factory(
+            APP__ENV="staging",
+            GOWA__ENABLED="true",
+            GOWA__BASE_URL=url,
+            **_DEPLOYED,
+            **_GOWA_CREDENTIALS,
+        )
+        assert cfg.gowa.base_url == url
+
+    def test_plain_http_over_the_internet_is_rejected_when_deployed(
+        self, settings_factory: Any
+    ) -> None:
+        """The basic-auth credentials go to this URL on every reply."""
+        with pytest.raises(ValidationError, match="GOWA__BASE_URL"):
+            settings_factory(
+                APP__ENV="production",
+                GOWA__ENABLED="true",
+                GOWA__BASE_URL="http://gowa.example.com",
+                **_DEPLOYED,
+                **_GOWA_CREDENTIALS,
+            )
+
+    @pytest.mark.parametrize("url", ["gowa:3000", "ftp://gowa", "http://user:pw@gowa"])
+    def test_a_malformed_base_url_is_rejected(self, settings_factory: Any, url: str) -> None:
+        with pytest.raises(ValidationError, match="GOWA__BASE_URL"):
+            settings_factory(GOWA__BASE_URL=url)
+
+    def test_the_typing_delay_is_bounded(self, settings_factory: Any) -> None:
+        with pytest.raises(ValidationError):
+            settings_factory(GOWA__TYPING_DELAY_S="30")
+
+    def test_credentials_never_render(self, settings_factory: Any) -> None:
+        cfg = settings_factory(GOWA__ENABLED="true", **_GOWA_CREDENTIALS)
+        rendered = repr(cfg) + cfg.model_dump_json()
+        for secret in ("gateway-password", GOWA_WEBHOOK_SECRET):
+            assert secret not in rendered
+
+
 LINK_SECRET = "s" * 32
 
 _COMPOSIO = {

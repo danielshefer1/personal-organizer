@@ -25,6 +25,7 @@ from personal_organizer.messaging.runtime import (
 from personal_organizer.observability.langfuse import flush_langfuse, init_langfuse
 from personal_organizer.observability.logging import configure_logging
 from personal_organizer.observability.sentry import init_sentry
+from personal_organizer.providers.channel.gowa.outbound import GowaOutbound
 from personal_organizer.providers.channel.whatsapp.outbound import WhatsAppOutbound
 from personal_organizer.settings import Settings, get_settings
 from personal_organizer.worker.app import build_procrastinate_app
@@ -47,6 +48,24 @@ async def _open_whatsapp(settings: Settings, stack: AsyncExitStack) -> None:
     stack.callback(unregister_outbound_channel, channel.name)
 
 
+async def _open_gowa(settings: Settings, stack: AsyncExitStack) -> None:
+    """The gateway's client: basic auth on every request, and room for the typing pause."""
+    gowa = settings.gowa
+    if gowa.basic_auth_user is None or gowa.basic_auth_password is None:  # pragma: no cover
+        msg = "GOWA sending needs GOWA__BASIC_AUTH_USER and GOWA__BASIC_AUTH_PASSWORD"
+        raise ValueError(msg)
+    http = await stack.enter_async_context(
+        httpx.AsyncClient(
+            base_url=f"{gowa.base_url}/",
+            auth=httpx.BasicAuth(gowa.basic_auth_user, gowa.basic_auth_password.get_secret_value()),
+            timeout=httpx.Timeout(gowa.send_timeout_s, connect=5.0),
+        )
+    )
+    channel = GowaOutbound.from_settings(gowa, http)
+    register_outbound_channel(channel)
+    stack.callback(unregister_outbound_channel, channel.name)
+
+
 async def run(settings: Settings) -> None:
     async with AsyncExitStack() as stack:
         database = Database(settings)
@@ -60,6 +79,8 @@ async def run(settings: Settings) -> None:
 
         if settings.whatsapp.enabled:
             await _open_whatsapp(settings, stack)
+        if settings.gowa.enabled:
+            await _open_gowa(settings, stack)
 
         app = build_procrastinate_app(settings)
         await stack.enter_async_context(app.open_async())
@@ -69,6 +90,7 @@ async def run(settings: Settings) -> None:
             env=settings.app.env,
             release=settings.app.release,
             whatsapp_enabled=settings.whatsapp.enabled,
+            gowa_enabled=settings.gowa.enabled,
             channels=list(outbound_channel_names()),
             allowlist_size=len(settings.whatsapp.allowlist),
         )

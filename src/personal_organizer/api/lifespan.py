@@ -56,6 +56,7 @@ def make_lifespan(
                 env=settings.app.env,
                 release=settings.app.release,
                 whatsapp_enabled=settings.whatsapp.enabled,
+                gowa_enabled=settings.gowa.enabled,
             )
             yield
             log.info("api.stopping")

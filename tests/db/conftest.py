@@ -12,11 +12,12 @@ from typing import Any
 
 import asyncpg
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from personal_organizer.db.dsn import normalise
 from personal_organizer.db.roles import DatabaseRole
-from personal_organizer.settings import Settings
+from personal_organizer.settings import Settings, WhatsAppSettings
+from tests.fixtures.payloads import APP_SECRET, PHONE_NUMBER_ID
 
 
 def _real_settings() -> Settings:
@@ -86,3 +87,19 @@ async def clean_channel_tables(owner_conn: Any) -> AsyncIterator[None]:
         yield
     finally:
         await owner_conn.execute(f"TRUNCATE {_CHANNEL_TABLES} CASCADE")
+
+
+@pytest.fixture
+def whatsapp_db_settings(db_settings: Settings) -> Settings:
+    """The real database settings with Meta's channel switched on."""
+    return db_settings.model_copy(
+        update={
+            "whatsapp": WhatsAppSettings(
+                enabled=True,
+                app_secret=SecretStr(APP_SECRET.decode()),
+                verify_token=SecretStr("v" * 64),
+                access_token=SecretStr("graph-token"),
+                phone_number_id=PHONE_NUMBER_ID,
+            )
+        }
+    )

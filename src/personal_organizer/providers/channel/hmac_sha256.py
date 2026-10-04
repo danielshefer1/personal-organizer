@@ -1,7 +1,9 @@
-"""``X-Hub-Signature-256`` verification.
+"""``X-Hub-Signature-256`` verification, shared by every provider that signs this way.
 
-Meta sends ``sha256=<hex>``: an HMAC-SHA256 of the **exact bytes** it posted, keyed with the
-app secret. Two things make this easy to get subtly wrong:
+The header is ``sha256=<hex>``: an HMAC-SHA256 of the **exact bytes** posted, keyed with a
+shared secret. Meta signs its webhooks so (keyed with the app secret), and the GOWA gateway
+copies the scheme (keyed with ``WHATSAPP_WEBHOOK_SECRET``). Two things make this easy to get
+subtly wrong:
 
 - It must be computed over the raw body, never a re-serialised parse -- which is why the
   webhook router uses ``RawBodyRoute`` and nothing above it may rewrite bodies.
@@ -22,7 +24,7 @@ _HEX_DIGITS: Final = frozenset("0123456789abcdef")
 
 
 def sign(secret: bytes, raw_body: bytes) -> str:
-    """The header value Meta would send for ``raw_body``. Used by tests and the simulator."""
+    """The header value a provider would send for ``raw_body``. Used by tests and simulators."""
     return _PREFIX + hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
 
 
@@ -31,7 +33,7 @@ def verify_signature(secret: bytes | None, raw_body: bytes, header: str | None) 
 
     False -- never an exception -- for a missing secret, a missing or malformed header, and
     a mismatch. A missing secret failing closed is deliberate defence in depth: settings
-    already refuse to enable WhatsApp without one.
+    already refuse to enable a provider without one.
     """
     if not secret or not header or not header.startswith(_PREFIX):
         return False

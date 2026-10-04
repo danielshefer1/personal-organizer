@@ -28,7 +28,7 @@ from starlette.status import HTTP_200_OK, HTTP_401_UNAUTHORIZED, HTTP_403_FORBID
 
 from personal_organizer.api.deps import InboundChannelDep, IngressStoreDep, SettingsDep
 from personal_organizer.api.routing import RawBodyRoute
-from personal_organizer.providers.channel.whatsapp.signature import (
+from personal_organizer.providers.channel.hmac_sha256 import (
     SIGNATURE_HEADER,
     rejection_reason,
 )

@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from httpx import AsyncClient
 
 from personal_organizer.api.app import create_app
-from personal_organizer.providers.channel.whatsapp.signature import sign
+from personal_organizer.providers.channel.hmac_sha256 import sign
 from personal_organizer.settings import Settings
 from tests.api.conftest import FakeDatabase, FakeIngressStore, FakeProcrastinate
 from tests.fixtures.payloads import (

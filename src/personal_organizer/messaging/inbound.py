@@ -8,6 +8,11 @@ at most once a day, and their message content is deleted.
 
 Everything is idempotent under a re-run of the job: ``processed_at`` ends a re-run early,
 and replies go through :func:`send_once`.
+
+Replies go out on the channel the message came in on. Several channels can be live at once,
+so the handler is given a resolver and looks up the row's ``channel`` by name. The
+invite-only mute, though, is per *person* (``recipient_key``), not per channel: a stranger
+who writes to two of our numbers is told once.
 """
 
 from __future__ import annotations
@@ -75,7 +80,11 @@ class InboxRow:
         )
 
 
-OnAllowed = Callable[[InboxRow], Awaitable[None]]
+#: The handoff for an allowed sender, given the channel to answer on.
+OnAllowed = Callable[[InboxRow, OutboundChannel], Awaitable[None]]
+
+#: Looks up an outbound channel by name; raises ``ChannelNotConfiguredError`` if it is absent.
+ChannelResolver = Callable[[str], OutboundChannel]
 
 
 def _utcnow() -> datetime:
@@ -114,7 +123,7 @@ async def _finish(db: Database, row: InboxRow, disposition: str, *, purge: bool)
         await session.execute(update(ChannelInbox).where(ChannelInbox.id == row.id).values(values))
 
 
-async def acknowledge(row: InboxRow, *, db: Database, channel: OutboundChannel) -> None:
+async def acknowledge(row: InboxRow, channel: OutboundChannel, *, db: Database) -> None:
     """Iteration 02's ``on_allowed``: the fixed acknowledgement. Iteration 04 replaces it."""
     if row.sender_phone is None:  # pragma: no cover - allowlisting requires a phone
         return
@@ -153,7 +162,7 @@ async def handle_inbound(
     inbox_id: UUID,
     *,
     db: Database,
-    channel: OutboundChannel,
+    channels: ChannelResolver,
     allowlist: frozenset[str],
     on_allowed: OnAllowed,
     now: Callable[[], datetime] = _utcnow,
@@ -165,6 +174,9 @@ async def handle_inbound(
         return None
     if row.processed_at is not None:
         return row.disposition
+    # Before anything is claimed or sent: a row whose channel this worker does not serve
+    # (switched off with jobs still queued) fails here and stays unprocessed for a re-run.
+    channel = channels(row.channel)
 
     allowed = row.sender_phone is not None and row.sender_phone in allowlist
     current = now()
@@ -180,7 +192,7 @@ async def handle_inbound(
             log.warning(
                 "inbound.mark_read_failed", inbox_id=str(row.id), error_type=type(exc).__name__
             )
-        await on_allowed(row)
+        await on_allowed(row, channel)
         disposition = "allowed"
     else:
         disposition = await _turn_away(db, channel, row, current)
@@ -197,4 +209,12 @@ async def handle_inbound(
     return disposition
 
 
-__all__ = ["ACK", "INVITE_ONLY", "InboxRow", "OnAllowed", "acknowledge", "handle_inbound"]
+__all__ = [
+    "ACK",
+    "INVITE_ONLY",
+    "ChannelResolver",
+    "InboxRow",
+    "OnAllowed",
+    "acknowledge",
+    "handle_inbound",
+]

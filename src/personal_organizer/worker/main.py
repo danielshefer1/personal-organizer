@@ -17,7 +17,11 @@ import httpx
 import structlog
 
 from personal_organizer.db.engine import Database, set_database
-from personal_organizer.messaging.runtime import set_outbound_channel
+from personal_organizer.messaging.runtime import (
+    outbound_channel_names,
+    register_outbound_channel,
+    unregister_outbound_channel,
+)
 from personal_organizer.observability.langfuse import flush_langfuse, init_langfuse
 from personal_organizer.observability.logging import configure_logging
 from personal_organizer.observability.sentry import init_sentry
@@ -38,8 +42,9 @@ async def _open_whatsapp(settings: Settings, stack: AsyncExitStack) -> None:
             timeout=httpx.Timeout(whatsapp.send_timeout_s, connect=5.0),
         )
     )
-    set_outbound_channel(WhatsAppOutbound.from_settings(whatsapp, http))
-    stack.callback(set_outbound_channel, None)
+    channel = WhatsAppOutbound.from_settings(whatsapp, http)
+    register_outbound_channel(channel)
+    stack.callback(unregister_outbound_channel, channel.name)
 
 
 async def run(settings: Settings) -> None:
@@ -64,6 +69,7 @@ async def run(settings: Settings) -> None:
             env=settings.app.env,
             release=settings.app.release,
             whatsapp_enabled=settings.whatsapp.enabled,
+            channels=list(outbound_channel_names()),
             allowlist_size=len(settings.whatsapp.allowlist),
         )
         await app.run_worker_async(

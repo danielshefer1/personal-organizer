@@ -15,6 +15,7 @@ from personal_organizer import __version__
 from personal_organizer.api.lifespan import make_lifespan
 from personal_organizer.api.middleware import RequestContextMiddleware
 from personal_organizer.api.routers import health, internal, webhooks
+from personal_organizer.providers.channel.gowa.inbound import GowaInbound
 from personal_organizer.providers.channel.whatsapp.inbound import WhatsAppInbound
 from personal_organizer.settings import Settings
 
@@ -47,11 +48,17 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(health.router)
     if settings.app.env != "production":
         app.include_router(internal.router)
-    # Not mounted at all until configured, so a deploy without Meta credentials exposes
-    # nothing -- rather than a route that must remember to reject everything.
+    # Not mounted at all until configured, so a deploy without a provider's credentials
+    # exposes nothing for it -- rather than a route that must remember to reject everything.
+    # Providers are independent: any combination may be live, each on its own path.
+    inbound: list[WhatsAppInbound | GowaInbound] = []
     if settings.whatsapp.enabled:
-        app.state.inbound_channel = WhatsAppInbound.from_settings(settings.whatsapp)
-        app.include_router(webhooks.router)
+        inbound.append(WhatsAppInbound.from_settings(settings.whatsapp))
+        app.include_router(webhooks.whatsapp_router)
+    if settings.gowa.enabled:
+        inbound.append(GowaInbound.from_settings(settings.gowa))
+        app.include_router(webhooks.gowa_router)
+    app.state.inbound_channels = {channel.name: channel for channel in inbound}
 
     @app.exception_handler(RequestValidationError)
     async def _validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:

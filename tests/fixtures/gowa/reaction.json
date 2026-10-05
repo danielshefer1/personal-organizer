@@ -1,0 +1,13 @@
+{
+  "event": "message.reaction",
+  "device_id": "31600000001@s.whatsapp.net",
+  "payload": {
+    "id": "88760C69D1F35FEB239102699AE90000",
+    "chat_id": "31612345678@s.whatsapp.net",
+    "from": "31612345678@s.whatsapp.net",
+    "timestamp": "2026-09-21T14:24:00Z",
+    "is_from_me": false,
+    "reaction": "+1",
+    "reacted_message_id": "3EB0C127D7BACC83D6A1"
+  }
+}

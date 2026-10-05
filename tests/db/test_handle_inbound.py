@@ -23,7 +23,7 @@ from personal_organizer.core.errors import (
     TransientChannelError,
 )
 from personal_organizer.db.engine import Database
-from personal_organizer.interfaces.channel import OutboundMessage
+from personal_organizer.interfaces.channel import OutboundChannel, OutboundMessage
 from personal_organizer.messaging.inbound import InboxRow, acknowledge, handle_inbound
 from personal_organizer.messaging.outbox import send_once
 from personal_organizer.messaging.replies import ACK_TEXT, INVITE_ONLY_TEXT
@@ -40,7 +40,10 @@ ALLOWLIST = frozenset({SENDER_PHONE})
 class FakeOutbound:
     name = "whatsapp"
 
-    def __init__(self, *failures: ChannelError, mark_read_fails: bool = False) -> None:
+    def __init__(
+        self, *failures: ChannelError, mark_read_fails: bool = False, name: str = "whatsapp"
+    ) -> None:
+        self.name = name
         self.failures = list(failures)
         self.mark_read_fails = mark_read_fails
         self.attempts: list[OutboundMessage] = []
@@ -67,7 +70,7 @@ class Spy:
     def __init__(self) -> None:
         self.calls: list[InboxRow] = []
 
-    async def __call__(self, row: InboxRow) -> None:
+    async def __call__(self, row: InboxRow, channel: OutboundChannel) -> None:
         self.calls.append(row)
 
 
@@ -87,12 +90,13 @@ async def _inbox(
     user_id: str | None = None,
     body: str = "Oncology appointment with Dr Meyer",
     sent_at: datetime | None = None,
+    channel: str = "whatsapp",
 ) -> UUID:
     key = f"uid:{user_id}" if user_id else f"tel:{phone}"
     inbox_id: UUID = await conn.fetchval(
         "INSERT INTO channel_inbox (channel, provider_message_id, sender_key, sender_user_id, "
         "sender_phone, message_type, body, raw, sent_at) "
-        "VALUES ('whatsapp', $1, $2, $3, $4, 'text', $5, $6::jsonb, $7) RETURNING id",
+        "VALUES ($8, $1, $2, $3, $4, 'text', $5, $6::jsonb, $7) RETURNING id",
         f"wamid.{uuid4().hex}",
         key,
         user_id,
@@ -100,6 +104,7 @@ async def _inbox(
         body,
         json.dumps({"text": {"body": body}}),
         sent_at or datetime.now(UTC),
+        channel,
     )
     return inbox_id
 
@@ -109,13 +114,13 @@ async def _run(
 ) -> str | None:
     """Run the handler the way the task does: ``acknowledge`` as the default handoff."""
 
-    async def ack(row: InboxRow) -> None:
-        await acknowledge(row, db=db, channel=channel)
+    async def ack(row: InboxRow, resolved: OutboundChannel) -> None:
+        await acknowledge(row, resolved, db=db)
 
     return await handle_inbound(
         inbox_id,
         db=db,
-        channel=channel,
+        channels={channel.name: channel}.__getitem__,
         allowlist=ALLOWLIST,
         on_allowed=on_allowed or ack,
         **kw,
@@ -329,6 +334,64 @@ class TestStrangers:
         inbox_id = await _inbox(owner_conn, phone=STRANGER_PHONE, sent_at=sent_at)
         assert await _run(db, inbox_id, FakeOutbound()) == "stale"
         assert (await _row(owner_conn, inbox_id))["body"] is None
+
+
+class TestSeveralChannels:
+    """Meta and the gateway live side by side: each message is answered where it arrived."""
+
+    @staticmethod
+    async def _handle(db: Database, inbox_id: UUID, *channels: FakeOutbound) -> str | None:
+        async def ack(row: InboxRow, resolved: OutboundChannel) -> None:
+            await acknowledge(row, resolved, db=db)
+
+        return await handle_inbound(
+            inbox_id,
+            db=db,
+            channels={channel.name: channel for channel in channels}.__getitem__,
+            allowlist=ALLOWLIST,
+            on_allowed=ack,
+        )
+
+    async def test_each_reply_goes_out_on_its_own_channel(
+        self, db: Database, owner_conn: Any
+    ) -> None:
+        meta, gowa = FakeOutbound(name="whatsapp"), FakeOutbound(name="gowa")
+        via_meta = await _inbox(owner_conn, channel="whatsapp")
+        via_gowa = await _inbox(owner_conn, channel="gowa")
+
+        assert await self._handle(db, via_meta, meta, gowa) == "allowed"
+        assert await self._handle(db, via_gowa, meta, gowa) == "allowed"
+
+        assert meta.sent == [OutboundMessage(recipient=SENDER_PHONE, body=ACK_TEXT)]
+        assert gowa.sent == [OutboundMessage(recipient=SENDER_PHONE, body=ACK_TEXT)]
+        channels = await owner_conn.fetch("SELECT channel FROM channel_outbox ORDER BY channel")
+        assert [row["channel"] for row in channels] == ["gowa", "whatsapp"]
+
+    async def test_a_stranger_is_told_once_across_channels(
+        self, db: Database, owner_conn: Any
+    ) -> None:
+        meta, gowa = FakeOutbound(name="whatsapp"), FakeOutbound(name="gowa")
+        first = await _inbox(owner_conn, phone=STRANGER_PHONE, channel="whatsapp")
+        second = await _inbox(owner_conn, phone=STRANGER_PHONE, channel="gowa")
+
+        assert await self._handle(db, first, meta, gowa) == "stranger"
+        assert await self._handle(db, second, meta, gowa) == "stranger_muted"
+
+        assert len(meta.sent) == 1
+        assert gowa.sent == []
+
+    async def test_a_channel_this_worker_lacks_fails_before_sending(
+        self, db: Database, owner_conn: Any
+    ) -> None:
+        meta = FakeOutbound(name="whatsapp")
+        inbox_id = await _inbox(owner_conn, channel="gowa")
+
+        with pytest.raises(KeyError):
+            await self._handle(db, inbox_id, meta)
+
+        assert meta.attempts == []
+        assert await _outbox(owner_conn) == []
+        assert (await _row(owner_conn, inbox_id))["processed_at"] is None
 
 
 class TestEdges:

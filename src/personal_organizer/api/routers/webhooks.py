@@ -1,18 +1,21 @@
-"""``/webhooks/whatsapp`` -- Meta's Cloud API webhook.
+"""Inbound webhooks: ``/webhooks/whatsapp`` (Meta's Cloud API) and ``/webhooks/gowa``
+(the GOWA gateway).
 
 Thin by design: verify, persist, answer. Everything that could be slow or could fail for
-reasons other than our own database happens in the worker, because Meta retries anything it
-does not see acknowledged and a slow ack becomes a duplicate delivery.
+reasons other than our own database happens in the worker, because both senders retry
+anything they do not see acknowledged and a slow ack becomes a duplicate delivery.
 
-Status codes are chosen for what Meta does with them, not for REST purity:
+Status codes are chosen for what the sender does with them, not for REST purity:
 
-- **401** for a bad signature. Not from Meta, so nobody retries it.
+- **401** for a bad signature. Not from the provider, so nobody retries it.
 - **200** for a validly signed body we cannot use (bad JSON, a shape we do not know). A
-  retry cannot fix it, and anything else earns seven days of redeliveries.
+  retry cannot fix it, and anything else earns days of redeliveries.
 - **500** when our database fails. Nothing was committed, and a redelivery is exactly
   what should happen.
 
-Mounted only when ``WHATSAPP__ENABLED`` is true; see :func:`create_app`.
+Each router is mounted only when its provider is enabled, and both may be; see
+:func:`create_app`. Both sign the same way (``X-Hub-Signature-256``), each with its own
+secret, so a body signed for one is refused by the other.
 """
 
 from __future__ import annotations
@@ -22,16 +25,19 @@ import secrets
 from typing import Annotated, Final
 
 import structlog
-from fastapi import APIRouter, Query, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 from starlette.status import HTTP_200_OK, HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN
 
-from personal_organizer.api.deps import InboundChannelDep, IngressStoreDep, SettingsDep
+from personal_organizer.api.deps import IngressStoreDep, SettingsDep, inbound_channel
 from personal_organizer.api.routing import RawBodyRoute
-from personal_organizer.providers.channel.whatsapp.signature import (
+from personal_organizer.interfaces.channel import InboundChannel
+from personal_organizer.providers.channel.gowa.inbound import CHANNEL_NAME as GOWA
+from personal_organizer.providers.channel.hmac_sha256 import (
     SIGNATURE_HEADER,
     rejection_reason,
 )
+from personal_organizer.providers.channel.whatsapp.inbound import CHANNEL_NAME as WHATSAPP
 
 log = structlog.get_logger(__name__)
 
@@ -39,10 +45,51 @@ log = structlog.get_logger(__name__)
 #: echo service for arbitrary content even for a caller who has the verify token.
 MAX_CHALLENGE_LENGTH: Final = 128
 
-router = APIRouter(prefix="/webhooks", tags=["webhooks"], route_class=RawBodyRoute)
+whatsapp_router = APIRouter(prefix="/webhooks", tags=["webhooks"], route_class=RawBodyRoute)
+gowa_router = APIRouter(prefix="/webhooks", tags=["webhooks"], route_class=RawBodyRoute)
+
+WhatsAppChannelDep = Annotated[InboundChannel, Depends(inbound_channel(WHATSAPP))]
+GowaChannelDep = Annotated[InboundChannel, Depends(inbound_channel(GOWA))]
 
 
-@router.get("/whatsapp", summary="Meta's subscription handshake.")
+def _event(channel: InboundChannel, what: str) -> str:
+    """``whatsapp.signature_rejected``, ``gowa.signature_rejected``: one name per channel."""
+    return f"{channel.name}.{what}"
+
+
+async def _ingest(request: Request, channel: InboundChannel, store: IngressStoreDep) -> Response:
+    """Verify, parse, persist. Log events are prefixed with the channel's name."""
+    raw_body: bytes = request.state.raw_body
+    header = request.headers.get(SIGNATURE_HEADER)
+    if not channel.verify_signature(raw_body, header):
+        # Not a Sentry event: this is the internet knocking, and a flood of them is not a bug.
+        log.warning(
+            _event(channel, "signature_rejected"),
+            channel=channel.name,
+            reason=rejection_reason(header),
+        )
+        return Response(status_code=HTTP_401_UNAUTHORIZED)
+
+    try:
+        payload = json.loads(raw_body)
+    except ValueError:
+        log.warning(_event(channel, "payload_unparseable"), channel=channel.name)
+        return Response(status_code=HTTP_200_OK)
+
+    batch = channel.parse_webhook(payload)
+    result = await store.record(channel.name, batch)
+    log.info(
+        "ingress.recorded",
+        channel=channel.name,
+        message_count=result.inserted,
+        duplicate_count=result.duplicates,
+        status_count=result.statuses_applied,
+        skipped_count=batch.skipped,
+    )
+    return Response(status_code=HTTP_200_OK)
+
+
+@whatsapp_router.get("/whatsapp", summary="Meta's subscription handshake.")
 async def verify_subscription(
     settings: SettingsDep,
     mode: Annotated[str | None, Query(alias="hub.mode")] = None,
@@ -70,34 +117,18 @@ async def verify_subscription(
     return PlainTextResponse(challenge)
 
 
-@router.post("/whatsapp", summary="Inbound messages and delivery statuses.")
-async def receive(request: Request, channel: InboundChannelDep, store: IngressStoreDep) -> Response:
-    raw_body: bytes = request.state.raw_body
-    header = request.headers.get(SIGNATURE_HEADER)
-    if not channel.verify_signature(raw_body, header):
-        # Not a Sentry event: this is the internet knocking, and a flood of them is not a bug.
-        log.warning(
-            "whatsapp.signature_rejected", channel=channel.name, reason=rejection_reason(header)
-        )
-        return Response(status_code=HTTP_401_UNAUTHORIZED)
-
-    try:
-        payload = json.loads(raw_body)
-    except ValueError:
-        log.warning("whatsapp.payload_unparseable", channel=channel.name)
-        return Response(status_code=HTTP_200_OK)
-
-    batch = channel.parse_webhook(payload)
-    result = await store.record(channel.name, batch)
-    log.info(
-        "ingress.recorded",
-        channel=channel.name,
-        message_count=result.inserted,
-        duplicate_count=result.duplicates,
-        status_count=result.statuses_applied,
-        skipped_count=batch.skipped,
-    )
-    return Response(status_code=HTTP_200_OK)
+@whatsapp_router.post("/whatsapp", summary="Meta: inbound messages and delivery statuses.")
+async def receive_whatsapp(
+    request: Request, channel: WhatsAppChannelDep, store: IngressStoreDep
+) -> Response:
+    return await _ingest(request, channel, store)
 
 
-__all__ = ["MAX_CHALLENGE_LENGTH", "router"]
+@gowa_router.post("/gowa", summary="GOWA gateway: inbound messages and receipts.")
+async def receive_gowa(
+    request: Request, channel: GowaChannelDep, store: IngressStoreDep
+) -> Response:
+    return await _ingest(request, channel, store)
+
+
+__all__ = ["MAX_CHALLENGE_LENGTH", "gowa_router", "whatsapp_router"]

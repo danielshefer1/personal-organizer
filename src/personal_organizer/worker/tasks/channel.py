@@ -45,13 +45,13 @@ def register(app: procrastinate.App) -> None:
     @app.task(queue=Queue.WEBHOOKS.value, name=HANDLE_INBOUND_TASK, retry=INBOUND_RETRY)
     async def handle_inbound_task(inbox_id: str) -> None:
         db = get_database()
-        channel = get_outbound_channel()
         await handle_inbound(
             UUID(inbox_id),
             db=db,
-            channel=channel,
+            channels=get_outbound_channel,
+            # The invite list, whichever channel the message came in on.
             allowlist=get_settings().whatsapp.allowlist,
-            on_allowed=functools.partial(acknowledge, db=db, channel=channel),
+            on_allowed=functools.partial(acknowledge, db=db),
         )
 
 

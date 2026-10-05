@@ -1,0 +1,16 @@
+{
+  "event": "message",
+  "device_id": "31600000001@s.whatsapp.net",
+  "payload": {
+    "id": "3EB0C127D7BACC83D6A4",
+    "chat_id": "31612345678@s.whatsapp.net",
+    "from": "31612345678@s.whatsapp.net",
+    "timestamp": "2026-09-21T14:17:00Z",
+    "body": "Thursday 10:00",
+    "selection": {
+      "kind": "list",
+      "text": "Thursday 10:00",
+      "selected_id": "slot-3"
+    }
+  }
+}

@@ -1,5 +1,11 @@
 # Runbook — Iteration 02: connecting WhatsApp
 
+> **Phase B is parked (2026-10-04).** Meta disabled the WhatsApp Business Account on
+> 2026-09-30 pending business verification. Until it is restored, WhatsApp runs through the
+> GOWA gateway instead: `docs/runbook-whatsapp-gateway.md`, and docs/adr/0004. Phase B step 1
+> is also out of date: Meta now creates the app from the "Connect with customers through
+> WhatsApp" use case, not app type "Business" plus an added product.
+
 Iteration 02 is done when **replaying the same webhook ten times creates one job, an unsigned
 or wrongly signed POST is rejected, and an unregistered sender uses no LLM budget**. All
 three are mechanised in the test suite (below). What remains is connecting a real Meta app,

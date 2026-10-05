@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Final
 
-from personal_organizer.providers.channel.whatsapp.signature import sign
+from personal_organizer.providers.channel.hmac_sha256 import sign
 
 DIR: Final = Path(__file__).resolve().parent / "whatsapp"
 

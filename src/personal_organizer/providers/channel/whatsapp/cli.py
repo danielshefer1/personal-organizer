@@ -30,8 +30,8 @@ import httpx
 from personal_organizer.core.phone import normalise_e164
 from personal_organizer.interfaces.channel import SenderRef
 from personal_organizer.observability.redaction import hash_identifier
+from personal_organizer.providers.channel.hmac_sha256 import SIGNATURE_HEADER, sign
 from personal_organizer.providers.channel.whatsapp.parser import MESSAGES_FIELD, WEBHOOK_OBJECT
-from personal_organizer.providers.channel.whatsapp.signature import SIGNATURE_HEADER, sign
 from personal_organizer.settings import Settings, get_settings
 
 

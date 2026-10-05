@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from personal_organizer.interfaces.channel import WebhookBatch
+from personal_organizer.providers.channel.hmac_sha256 import verify_signature
 from personal_organizer.providers.channel.whatsapp.parser import parse_webhook
-from personal_organizer.providers.channel.whatsapp.signature import verify_signature
 from personal_organizer.settings import WhatsAppSettings
 
 CHANNEL_NAME: Final = "whatsapp"

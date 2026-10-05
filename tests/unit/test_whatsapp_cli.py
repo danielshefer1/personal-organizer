@@ -8,9 +8,9 @@ import httpx
 import pytest
 
 from personal_organizer.observability.redaction import redact_event
+from personal_organizer.providers.channel.hmac_sha256 import verify_signature
 from personal_organizer.providers.channel.whatsapp.cli import check, sender_hash, simulate
 from personal_organizer.providers.channel.whatsapp.parser import parse_webhook
-from personal_organizer.providers.channel.whatsapp.signature import verify_signature
 from personal_organizer.settings import Settings
 from tests.api.test_whatsapp_webhook import WHATSAPP_ENV
 from tests.fixtures.payloads import APP_SECRET, PHONE_NUMBER_ID

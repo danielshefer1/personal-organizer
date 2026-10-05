@@ -210,6 +210,233 @@ class TestWhatsApp:
             assert secret not in rendered
 
 
+GOWA_WEBHOOK_SECRET = "g" * 40
+
+_GOWA_CREDENTIALS = {
+    "GOWA__BASIC_AUTH_USER": "po",
+    "GOWA__BASIC_AUTH_PASSWORD": "gateway-password",
+    "GOWA__WEBHOOK_SECRET": GOWA_WEBHOOK_SECRET,
+}
+
+
+class TestGowa:
+    """The QR-code gateway: off by default, all-or-nothing when on, independent of Meta."""
+
+    def test_disabled_by_default_with_nothing_required(self, settings: Settings) -> None:
+        assert settings.gowa.enabled is False
+        assert settings.gowa.webhook_secret is None
+
+    def test_enabled_with_nothing_names_every_missing_credential_at_once(
+        self, settings_factory: Any
+    ) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            settings_factory(GOWA__ENABLED="true")
+        message = str(excinfo.value)
+        for name in _GOWA_CREDENTIALS:
+            assert name in message
+
+    def test_enabled_with_every_credential_boots(self, settings_factory: Any) -> None:
+        cfg = settings_factory(
+            GOWA__ENABLED="true", GOWA__BASE_URL="http://gowa:3000/", **_GOWA_CREDENTIALS
+        )
+        assert cfg.gowa.enabled
+        assert cfg.gowa.base_url == "http://gowa:3000"
+
+    @pytest.mark.parametrize("secret", ["secret", "short-but-not-the-default"])
+    def test_a_guessable_webhook_secret_is_rejected(
+        self, settings_factory: Any, secret: str
+    ) -> None:
+        """``secret`` is the gateway's documented default."""
+        with pytest.raises(ValidationError, match="GOWA__WEBHOOK_SECRET") as excinfo:
+            settings_factory(GOWA__WEBHOOK_SECRET=secret)
+        assert "short-but-not-the-default" not in str(excinfo.value)
+
+    def test_both_whatsapp_providers_may_run_at_once(self, settings_factory: Any) -> None:
+        cfg = settings_factory(
+            WHATSAPP__ENABLED="true",
+            GOWA__ENABLED="true",
+            **_WHATSAPP_CREDENTIALS,
+            **_GOWA_CREDENTIALS,
+        )
+        assert cfg.whatsapp.enabled
+        assert cfg.gowa.enabled
+
+    @pytest.mark.parametrize(
+        "url", ["http://gowa.railway.internal:3000", "https://gowa.example.com"]
+    )
+    def test_deployed_base_url_is_private_or_tls(self, settings_factory: Any, url: str) -> None:
+        cfg = settings_factory(
+            APP__ENV="staging",
+            GOWA__ENABLED="true",
+            GOWA__BASE_URL=url,
+            **_DEPLOYED,
+            **_GOWA_CREDENTIALS,
+        )
+        assert cfg.gowa.base_url == url
+
+    def test_plain_http_over_the_internet_is_rejected_when_deployed(
+        self, settings_factory: Any
+    ) -> None:
+        """The basic-auth credentials go to this URL on every reply."""
+        with pytest.raises(ValidationError, match="GOWA__BASE_URL"):
+            settings_factory(
+                APP__ENV="production",
+                GOWA__ENABLED="true",
+                GOWA__BASE_URL="http://gowa.example.com",
+                **_DEPLOYED,
+                **_GOWA_CREDENTIALS,
+            )
+
+    @pytest.mark.parametrize("url", ["gowa:3000", "ftp://gowa", "http://user:pw@gowa"])
+    def test_a_malformed_base_url_is_rejected(self, settings_factory: Any, url: str) -> None:
+        with pytest.raises(ValidationError, match="GOWA__BASE_URL"):
+            settings_factory(GOWA__BASE_URL=url)
+
+    def test_the_typing_delay_is_bounded(self, settings_factory: Any) -> None:
+        with pytest.raises(ValidationError):
+            settings_factory(GOWA__TYPING_DELAY_S="30")
+
+    def test_credentials_never_render(self, settings_factory: Any) -> None:
+        cfg = settings_factory(GOWA__ENABLED="true", **_GOWA_CREDENTIALS)
+        rendered = repr(cfg) + cfg.model_dump_json()
+        for secret in ("gateway-password", GOWA_WEBHOOK_SECRET):
+            assert secret not in rendered
+
+
+LINK_SECRET = "s" * 32
+
+_COMPOSIO = {
+    "COMPOSIO__API_KEY": "composio-key",
+    "COMPOSIO__CALENDAR_AUTH_CONFIG_ID": "ac_calendar123",
+    "APP__PUBLIC_BASE_URL": "https://staging.example.com",
+    "ONBOARDING__LINK_SECRET": LINK_SECRET,
+}
+
+
+class TestComposio:
+    """Off by default and all-or-nothing when on, like WhatsApp -- except that two of the
+    four things it needs live in other sections, so the check is on `Settings`."""
+
+    def test_disabled_by_default_with_nothing_required(self, settings: Settings) -> None:
+        assert settings.composio.enabled is False
+        assert settings.composio.api_key is None
+
+    @pytest.mark.parametrize("env", ["staging", "production"])
+    def test_a_deployed_service_boots_with_composio_disabled(
+        self, settings_factory: Any, env: str
+    ) -> None:
+        """What lets every PR in the Iteration 03 stack deploy before Composio exists."""
+        cfg = settings_factory(APP__ENV=env, **_DEPLOYED)
+        assert not cfg.composio.enabled
+
+    def test_enabled_with_nothing_names_every_missing_setting_at_once(
+        self, settings_factory: Any
+    ) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            settings_factory(COMPOSIO__ENABLED="true")
+        message = str(excinfo.value)
+        for name in _COMPOSIO:
+            assert name in message
+
+    def test_enabled_with_everything_boots(self, settings_factory: Any) -> None:
+        cfg = settings_factory(COMPOSIO__ENABLED="true", **_COMPOSIO)
+        assert cfg.composio.enabled
+        assert cfg.composio.calendar_auth_config_id == "ac_calendar123"
+
+    def test_enabled_in_production_boots(self, settings_factory: Any) -> None:
+        cfg = settings_factory(
+            APP__ENV="production", COMPOSIO__ENABLED="true", **_DEPLOYED, **_COMPOSIO
+        )
+        assert cfg.composio.enabled
+
+    @pytest.mark.parametrize("wrong", ["ca_connected123", "googlecalendar", "AC_upper"])
+    def test_something_other_than_an_auth_config_id_is_rejected(
+        self, settings_factory: Any, wrong: str
+    ) -> None:
+        """A connected-account id or a toolkit slug is the likely paste mistake, and it would
+        otherwise first fail at a real user's onboarding."""
+        with pytest.raises(ValidationError, match="CALENDAR_AUTH_CONFIG_ID"):
+            settings_factory(COMPOSIO__CALENDAR_AUTH_CONFIG_ID=wrong)
+
+    def test_credentials_never_render(self, settings_factory: Any) -> None:
+        cfg = settings_factory(COMPOSIO__ENABLED="true", **_COMPOSIO)
+        rendered = repr(cfg) + cfg.model_dump_json()
+        for secret in ("composio-key", LINK_SECRET):
+            assert secret not in rendered
+
+
+class TestPublicBaseUrl:
+    def test_unset_by_default(self, settings: Settings) -> None:
+        assert settings.app.public_base_url is None
+
+    def test_blank_means_unset(self, settings_factory: Any) -> None:
+        """A variable created in a dashboard and left empty is "not set", not an error."""
+        assert settings_factory(APP__PUBLIC_BASE_URL=" ").app.public_base_url is None
+
+    @pytest.mark.parametrize(
+        ("given", "stored"),
+        [
+            ("https://staging.example.com", "https://staging.example.com"),
+            ("https://staging.example.com/", "https://staging.example.com"),
+            ("http://localhost:8000", "http://localhost:8000"),
+        ],
+    )
+    def test_an_origin_is_stored_without_a_trailing_slash(
+        self, settings_factory: Any, given: str, stored: str
+    ) -> None:
+        """So that `base + "/connect/..."` never produces a double slash."""
+        assert settings_factory(APP__PUBLIC_BASE_URL=given).app.public_base_url == stored
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "staging.example.com",
+            "ftp://example.com",
+            "https://example.com/app",
+            "https://example.com?x=1",
+            "https://user:pw@example.com",
+        ],
+    )
+    def test_anything_but_an_origin_is_rejected(self, settings_factory: Any, bad: str) -> None:
+        with pytest.raises(ValidationError, match="PUBLIC_BASE_URL"):
+            settings_factory(APP__PUBLIC_BASE_URL=bad)
+
+    def test_plain_http_is_rejected_when_deployed(self, settings_factory: Any) -> None:
+        """Every onboarding link carries a bearer token in its path."""
+        with pytest.raises(ValidationError, match="PUBLIC_BASE_URL must be https"):
+            settings_factory(
+                APP__ENV="staging", APP__PUBLIC_BASE_URL="http://staging.example.com", **_DEPLOYED
+            )
+
+
+class TestOnboardingLinks:
+    def test_defaults(self, settings: Settings) -> None:
+        assert settings.onboarding.link_secret is None
+        assert settings.onboarding.link_ttl_s == 900
+
+    def test_a_short_link_secret_is_rejected(self, settings_factory: Any) -> None:
+        with pytest.raises(ValidationError, match="LINK_SECRET"):
+            settings_factory(ONBOARDING__LINK_SECRET="s" * 31)
+
+    def test_the_example_placeholder_is_rejected_when_deployed(self, settings_factory: Any) -> None:
+        """Copying .env.example into a deployed environment must not yield forgeable links."""
+        with pytest.raises(ValidationError, match="LINK_SECRET must be set to a real secret"):
+            settings_factory(
+                APP__ENV="production",
+                ONBOARDING__LINK_SECRET="local-dev-link-secret-not-a-secret-0000",
+                **_DEPLOYED,
+            )
+
+    def test_the_example_placeholder_is_fine_locally(self, settings_factory: Any) -> None:
+        cfg = settings_factory(ONBOARDING__LINK_SECRET="local-dev-link-secret-not-a-secret-0000")
+        assert cfg.onboarding.link_secret is not None
+
+    @pytest.mark.parametrize("ttl", ["59", "3601"])
+    def test_the_link_lifetime_is_bounded(self, settings_factory: Any, ttl: str) -> None:
+        with pytest.raises(ValidationError):
+            settings_factory(ONBOARDING__LINK_TTL_S=ttl)
+
+
 class TestThePlatformGuard:
     """`APP__ENV` is what every other check is gated on, so it cannot be optional.
 

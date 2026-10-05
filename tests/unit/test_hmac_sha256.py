@@ -5,7 +5,7 @@ import hmac
 
 import pytest
 
-from personal_organizer.providers.channel.whatsapp.signature import (
+from personal_organizer.providers.channel.hmac_sha256 import (
     rejection_reason,
     sign,
     verify_signature,

@@ -9,6 +9,7 @@ different ``env`` and ``release`` than it was constructed with.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Annotated
 
 import procrastinate
@@ -40,26 +41,32 @@ def get_ingress_store(request: Request) -> IngressStore:
     return store
 
 
-def get_inbound_channel(request: Request) -> InboundChannel:
-    channel: InboundChannel = request.app.state.inbound_channel
-    return channel
+def inbound_channel(name: str) -> Callable[[Request], InboundChannel]:
+    """A dependency resolving the inbound channel ``name``, as mounted by ``create_app``.
+
+    One per webhook route: several channels can be live at once, each on its own path.
+    """
+
+    def get(request: Request) -> InboundChannel:
+        channels: dict[str, InboundChannel] = request.app.state.inbound_channels
+        return channels[name]
+
+    return get
 
 
 DbDep = Annotated[Database, Depends(get_db)]
 ProcrastinateDep = Annotated[procrastinate.App, Depends(get_procrastinate)]
 SettingsDep = Annotated[Settings, Depends(get_app_settings)]
 IngressStoreDep = Annotated[IngressStore, Depends(get_ingress_store)]
-InboundChannelDep = Annotated[InboundChannel, Depends(get_inbound_channel)]
 
 __all__ = [
     "DbDep",
-    "InboundChannelDep",
     "IngressStoreDep",
     "ProcrastinateDep",
     "SettingsDep",
     "get_app_settings",
     "get_db",
-    "get_inbound_channel",
     "get_ingress_store",
     "get_procrastinate",
+    "inbound_channel",
 ]

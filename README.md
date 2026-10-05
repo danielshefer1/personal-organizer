@@ -6,15 +6,22 @@ skeleton)** and **Iteration 02 (WhatsApp webhook, queue and access controls)** e
 allowlisted sender gets a fixed acknowledgement, everyone else a one-line "invite-only"
 reply. There is no agent yet.
 
+WhatsApp arrives through either of two channels, separately switched and able to run side
+by side: Meta's Cloud API (`whatsapp`), and the GOWA QR-code gateway (`gowa`), which links a
+dedicated SIM as a WhatsApp Web device while Meta's business verification is pending
+(docs/adr/0004). A reply always goes out on the channel its message came in on.
+
 ## What is here
 
 | | |
 |---|---|
-| `src/personal_organizer/api/` | FastAPI service. `/health` (liveness), `/ready` (readiness, monitoring only), `/webhooks/whatsapp` (when enabled). |
+| `src/personal_organizer/api/` | FastAPI service. `/health` (liveness), `/ready` (readiness, monitoring only), `/webhooks/whatsapp` and `/webhooks/gowa` (each when enabled). |
 | `src/personal_organizer/worker/` | Procrastinate worker and task registry. |
 | `src/personal_organizer/db/` | Async engines per role, tenant-scoped sessions, bootstrap, `po-db`, ORM models. |
 | `src/personal_organizer/messaging/` | Provider-neutral ingress (persist-then-ack), the access-control gate, at-most-once replies. |
-| `src/personal_organizer/providers/channel/whatsapp/` | Meta Cloud API: signature, payload parser, Graph sends, `po-whatsapp`. |
+| `src/personal_organizer/providers/channel/whatsapp/` | Meta Cloud API: payload parser, Graph sends, `po-whatsapp`. |
+| `src/personal_organizer/providers/channel/gowa/` | The GOWA gateway: payload parser, REST sends, `po-gowa`. |
+| `src/personal_organizer/providers/channel/hmac_sha256.py` | `X-Hub-Signature-256` verification, which both sign with. |
 | `src/personal_organizer/observability/` | structlog + PII redaction, Sentry, Langfuse. |
 | `src/personal_organizer/interfaces/` | `LLMProvider`, `CalendarProvider`, `MemoryStore`, `InboundChannel`/`OutboundChannel`, `TasksProvider`, `ExportService`. |
 | `alembic/` | Migrations, `bootstrap.sql`, vendored Procrastinate schema. |
@@ -69,6 +76,16 @@ The worker then tries to reply through the Graph API and, with a made-up token, 
 local stub to see the whole happy path. Connecting a real Meta app is
 `docs/runbook-iteration-02.md`.
 
+The gateway channel works the same way, and needs no Meta at all: set `GOWA__ENABLED=true`
+with self-made credentials, then
+
+```sh
+uv run po-gowa simulate --url http://localhost:8000/webhooks/gowa --from +31612345678 --replay 10
+```
+
+To link a real phone, `docker compose --profile gateway up -d gowa` runs the gateway
+locally. Both, and staging, are `docs/runbook-whatsapp-gateway.md`.
+
 ### The local database holds nothing real
 
 Staging and production data live only on Railway. The local container exists so the test
@@ -116,6 +133,7 @@ staging only) `APP__INTERNAL_TOKEN`, so the Sentry project has to exist before t
 it defaults to `local`. Omitting it used to switch all of them off in silence rather than
 failing; a deployed container that does not declare its environment now refuses to start.
 
-WhatsApp is off unless `WHATSAPP__ENABLED=true`, and then all four of its credentials are
-required. Connecting it — Meta app, test number, webhook registration, and what each failure
-looks like — is `docs/runbook-iteration-02.md`.
+WhatsApp is off unless `WHATSAPP__ENABLED=true` or `GOWA__ENABLED=true` (or both), and then
+each one's credentials are required. Connecting Meta — app, test number, webhook
+registration, and what each failure looks like — is `docs/runbook-iteration-02.md`;
+connecting the gateway is `docs/runbook-whatsapp-gateway.md`.

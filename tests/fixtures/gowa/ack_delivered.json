@@ -1,0 +1,15 @@
+{
+  "event": "message.ack",
+  "device_id": "31600000001@s.whatsapp.net",
+  "timestamp": "2026-09-21T14:22:00Z",
+  "payload": {
+    "ids": [
+      "3EB0AAAAAAAAAAAAAAAA01",
+      "3EB0AAAAAAAAAAAAAAAA02"
+    ],
+    "chat_id": "31612345678@s.whatsapp.net",
+    "from": "31612345678@s.whatsapp.net",
+    "receipt_type": "delivered",
+    "receipt_type_description": "means the message was delivered to the device"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "event": "message",
+  "device_id": "31600000001@s.whatsapp.net",
+  "session_id": "po-bot",
+  "payload": {
+    "id": "3EB0C127D7BACC83D6A1",
+    "chat_id": "31612345678@s.whatsapp.net",
+    "from": "31612345678@s.whatsapp.net",
+    "from_lid": "251556368777322@lid",
+    "sender_display_name": "Saved Contact",
+    "from_name": "John Doe",
+    "timestamp": "2026-09-21T14:13:20Z",
+    "is_from_me": false,
+    "body": "Oncology appointment with Dr Meyer"
+  }
+}

@@ -16,20 +16,17 @@ import procrastinate
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from pydantic import SecretStr
 
 from personal_organizer.api.app import create_app
 from personal_organizer.db.dsn import normalise
 from personal_organizer.db.roles import DatabaseRole
 from personal_organizer.interfaces.channel import SenderRef
 from personal_organizer.messaging.ingress import PgIngressStore, sender_lock
-from personal_organizer.settings import Settings, WhatsAppSettings
+from personal_organizer.settings import Settings
 from personal_organizer.worker.app import build_procrastinate_app
 from personal_organizer.worker.queues import Queue
 from personal_organizer.worker.tasks.channel import HANDLE_INBOUND_TASK
 from tests.fixtures.payloads import (
-    APP_SECRET,
-    PHONE_NUMBER_ID,
     SENDER_PHONE,
     load,
     signed,
@@ -39,21 +36,6 @@ from tests.fixtures.payloads import (
 pytestmark = [pytest.mark.db, pytest.mark.usefixtures("clean_channel_tables")]
 
 URL = "/webhooks/whatsapp"
-
-
-@pytest.fixture
-def whatsapp_db_settings(db_settings: Settings) -> Settings:
-    return db_settings.model_copy(
-        update={
-            "whatsapp": WhatsAppSettings(
-                enabled=True,
-                app_secret=SecretStr(APP_SECRET.decode()),
-                verify_token=SecretStr("v" * 64),
-                access_token=SecretStr("graph-token"),
-                phone_number_id=PHONE_NUMBER_ID,
-            )
-        }
-    )
 
 
 def _pepper(settings: Settings) -> str:

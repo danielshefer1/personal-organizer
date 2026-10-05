@@ -160,6 +160,8 @@ SAFE_KEYS: Final = frozenset(
         "duplicate_count",
         "skipped_count",
         "whatsapp_enabled",
+        "gowa_enabled",
+        "channels",
         "allowlist_size",
         # db -- infrastructure coordinates, so that a connection failure says which host it
         # could not reach. The password lives in the DSN and never in these.

@@ -24,6 +24,8 @@ htmlcov/
 
 # Local Postgres data (docker compose volume)
 .pgdata/
+# The local GOWA gateway: a live WhatsApp session and a copy of its chats.
+.gowa/
 
 # Editors / OS
 .DS_Store

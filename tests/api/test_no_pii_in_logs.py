@@ -23,8 +23,10 @@ from personal_organizer.api.routing import RawBodyRoute
 from personal_organizer.observability.logging import configure_logging
 from personal_organizer.settings import Settings
 from tests.api.conftest import FakeIngressStore
+from tests.api.test_gowa_webhook import GOWA_ENV
 from tests.api.test_whatsapp_webhook import WHATSAPP_ENV
 from tests.conftest import CONTENT_PII, PATTERN_PII
+from tests.fixtures import gowa_payloads as gowa
 from tests.fixtures.payloads import WA_ID, signed, text_message
 
 ALL_PII = PATTERN_PII + CONTENT_PII
@@ -223,3 +225,54 @@ class TestWhatsAppWebhookLogs:
 
 
 WAMID = "wamid.HBgLMzE2MTIzNDU2NzgVAgASGBQzQTdEMEY1QjQ1RjE4NjhBMUUwRQA="
+
+GOWA_MESSAGE_ID = "3EB0C127D7BACC83D6A1F00D"
+LID = "251556368777322"
+
+
+class TestGowaWebhookLogs:
+    """The same guarantee for the gateway's webhook, whose payload also carries the
+    sender's JID, LID and display names."""
+
+    async def _post(
+        self,
+        settings_factory: Callable[..., Settings],
+        make_client: Callable[[FastAPI], AsyncClient],
+        stream: io.StringIO,
+        *,
+        bad_signature: bool = False,
+    ) -> str:
+        payload = gowa.text_message(
+            message_id=GOWA_MESSAGE_ID, body="Oncology appointment with Dr Meyer"
+        )
+        body, headers = gowa.signed(payload)
+        if bad_signature:
+            headers["x-hub-signature-256"] = "sha256=" + "0" * 64
+        application = create_app(settings_factory(**GOWA_ENV))
+        application.state.ingress_store = FakeIngressStore()
+        async with make_client(application) as client:
+            await client.post("/webhooks/gowa", content=body, headers=headers)
+        return stream.getvalue()
+
+    async def test_accepted_path(
+        self,
+        settings_factory: Callable[..., Settings],
+        make_client: Callable[[FastAPI], AsyncClient],
+        log_stream: io.StringIO,
+    ) -> None:
+        captured = await self._post(settings_factory, make_client, log_stream)
+        assert "ingress.recorded" in captured
+        _assert_absent(captured)
+        for identifier in (GOWA_MESSAGE_ID, WA_ID, LID, "John Doe", "Saved Contact"):
+            assert identifier not in captured
+
+    async def test_rejected_path(
+        self,
+        settings_factory: Callable[..., Settings],
+        make_client: Callable[[FastAPI], AsyncClient],
+        log_stream: io.StringIO,
+    ) -> None:
+        captured = await self._post(settings_factory, make_client, log_stream, bad_signature=True)
+        assert "gowa.signature_rejected" in captured
+        _assert_absent(captured)
+        assert GOWA_MESSAGE_ID not in captured

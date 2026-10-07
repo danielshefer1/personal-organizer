@@ -101,6 +101,16 @@ stops it; deleting `./.gowa` (or unlinking the device on the phone) ends the ses
    number that is not invited: the invite-only line, and silence for a second message that
    day. In the api's logs: `ingress.recorded` with `channel: gowa`; in the worker's:
    `inbound.handled`.
+8. **Prove the alarm.** Every five minutes the worker asks the gateway what `po-gowa status`
+   asks (`system:gowa_health`). While the answer is bad it logs `gowa.unhealthy` at error
+   level and sends Sentry one event; all of them group into a single issue named
+   `gowa.unhealthy`, tagged with the `reason`. To see it work, set the worker's
+   `GOWA__BASE_URL` to `http://gowa.railway.internal:3999` (a port nothing listens on) and
+   redeploy the worker. Within five minutes Sentry shows `gowa.unhealthy` with
+   `reason: unreachable`. Put the URL back, redeploy, and **resolve the issue** in Sentry. A
+   resolved issue reopens (a regression) the next time, and alerts again. An unresolved one
+   just collects events. Check that the Sentry project's alert rules email you on a new issue
+   and on a regression.
 
 Production waits until staging has run cleanly for a while, ideally with Meta's verification
 outcome known.
@@ -111,6 +121,10 @@ outcome known.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| Sentry issue `gowa.unhealthy`, `reason: not_logged_in` | the linked device was logged out | re-link (below), then resolve the issue |
+| `gowa.unhealthy`, `reason: unreachable` | the gateway is down, or not reachable at `GOWA__BASE_URL` | check the `gowa` service; see C5 |
+| `gowa.unhealthy`, `reason: bad_response`, `status_code: 401` | the worker's `GOWA__BASIC_AUTH_*` differs from the gateway's `APP_BASIC_AUTH` | make them equal |
+| `gowa.unhealthy`, `reason: not_connected`, once | the gateway was reconnecting to WhatsApp when it was asked | nothing, if it does not recur; recurring means the gateway's network |
 | api logs `gowa.signature_rejected` | `GOWA__WEBHOOK_SECRET` ≠ the gateway's `WHATSAPP_WEBHOOK_SECRET` | make them equal |
 | nothing in the api's logs | the gateway is not posting: wrong `WHATSAPP_WEBHOOK`, or logged out | check the gateway's logs and UI |
 | worker logs `gowa.error` with `status_code: 401` | the device is logged out, or the basic-auth pair differs | check the UI; re-link (C4), or fix the pair |
@@ -128,3 +142,5 @@ The session survives redeploys while the volume does. It ends if the phone unlin
 device, if the phone stays offline for about two weeks, or if WhatsApp logs it out. To
 re-link: open the gateway's UI (C4), log out the stale device if it is listed, and scan a
 new QR code. No variable changes.
+
+Then resolve the `gowa.unhealthy` issue in Sentry, so the next logout raises it again.

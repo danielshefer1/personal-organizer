@@ -16,7 +16,7 @@ import procrastinate
 from personal_organizer.db.dsn import normalise
 from personal_organizer.db.roles import DatabaseRole
 from personal_organizer.settings import Settings
-from personal_organizer.worker.tasks import REGISTRARS
+from personal_organizer.worker.tasks import REGISTRARS, gowa_health
 
 
 def build_procrastinate_app(settings: Settings) -> procrastinate.App:
@@ -36,6 +36,11 @@ def build_procrastinate_app(settings: Settings) -> procrastinate.App:
     )
     for register in REGISTRARS:
         register(app)
+    # Settings-dependent, so not in REGISTRARS: without a gateway the check could only ever
+    # alarm. The api builds this app too, and registers it there as well when GOWA is on;
+    # harmless, since only a worker runs periodic tasks.
+    if settings.gowa.enabled:
+        gowa_health.register(app, settings.gowa)
     return app
 
 

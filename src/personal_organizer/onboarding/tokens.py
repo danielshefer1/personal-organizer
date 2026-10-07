@@ -43,11 +43,11 @@ def sign(payload: TokenPayload, *, secret: str, salt: str) -> str:
 
 def verify(token: str, *, secret: str, salt: str, max_age_s: int) -> TokenPayload | None:
     """The payload of a token we signed under ``salt`` within ``max_age_s``, else ``None``."""
-    if not isinstance(token, str) or len(token) > MAX_TOKEN_LENGTH:
+    if not isinstance(token, str) or len(token) > MAX_TOKEN_LENGTH or not token.isascii():
         return None  # never decode or HMAC what cannot be ours; never raise
     try:
         data = _serializer(secret, salt).loads(token, max_age=max_age_s)
-    except BadData:  # bad signature, expired, undecodable: all the same to the caller
+    except BadData, ValueError:  # bad signature, expired, undecodable: all the same to the caller
         return None
     if not isinstance(data, dict):
         return None

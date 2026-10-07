@@ -81,12 +81,17 @@ def test_non_string_token_is_none(token: Any) -> None:
     assert verify(token, secret=SECRET, salt=LINK_SALT, max_age_s=900) is None
 
 
+@pytest.mark.parametrize("token", ["\ud800.a.b", "\u00e9.a.b"])
+def test_non_ascii_token_is_none(token: str) -> None:
+    assert verify(token, secret=SECRET, salt=LINK_SALT, max_age_s=900) is None
+
+
 def test_oversized_token_is_none() -> None:
     token = "a" * (MAX_TOKEN_LENGTH + 1)
     assert verify(token, secret=SECRET, salt=LINK_SALT, max_age_s=900) is None
 
 
-def test_cap_leaves_real_tokens_alone() -> None:
+def test_cap_length_garbage_is_none_and_real_tokens_are_far_below_it() -> None:
     token = sign(PAYLOAD, secret=SECRET, salt=LINK_SALT)
     assert len(token) < MAX_TOKEN_LENGTH // 4
     at_cap = "a" * MAX_TOKEN_LENGTH

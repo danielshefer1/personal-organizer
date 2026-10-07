@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
+from uuid import UUID
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -16,24 +17,34 @@ from sqlalchemy import select
 from personal_organizer.core.errors import CalendarProviderUnavailableError
 from personal_organizer.core.types import TenantId
 from personal_organizer.db.engine import Database
-from personal_organizer.db.models.tenant import OnboardingLink, Tenant
+from personal_organizer.db.models.tenant import CalendarConnection, OnboardingLink, Tenant
+from personal_organizer.db.repositories.connections import bind_connection
+from personal_organizer.db.repositories.tenants import get_tenant
+from personal_organizer.messaging.onboarding_text import t
+from personal_organizer.onboarding.connected import announce_connected
 from personal_organizer.onboarding.page_text import page_text
 from personal_organizer.onboarding.tokens import LINK_SALT, STATE_SALT, verify
 from personal_organizer.settings import Settings
-from tests.api.conftest import FakeProcrastinate
+from personal_organizer.worker.tasks.onboarding import ONBOARDING_CONNECTED_TASK
+from tests.api.conftest import DeferredCall, FakeProcrastinate
+from tests.db.test_handle_inbound import FakeOutbound
 from tests.fixtures.connect import (
+    ACCOUNT_ID,
     AUTH_CONFIG_ID,
     BASE_URL,
     LINK_SECRET,
     REDIRECT_URL,
     TRUNCATE_CONNECT_TABLES,
     FakeConnectLinker,
+    account,
     assert_hardened,
     assert_page,
     connect_app,
     make_active,
+    seed_inbound,
     seed_link,
     seed_tenant,
+    suspend,
     with_connect,
 )
 
@@ -206,3 +217,199 @@ class TestStart:
         assert_hardened(first)
         linker.failure = None
         assert (await http.post(url)).status_code == 410
+
+
+class FailingProcrastinate(FakeProcrastinate):
+    def configure_task(self, name: str, **options: Any) -> Any:
+        class Deferrer:
+            async def defer_async(self, **kwargs: Any) -> int:
+                msg = "queue down"
+                raise ConnectionError(msg)
+
+        return Deferrer()
+
+
+async def callback_url(
+    http: AsyncClient,
+    db: Database,
+    linker: FakeConnectLinker,
+    tenant_id: UUID,
+    *,
+    param: str = "connected_account_id",
+) -> str:
+    """Press the button, then build the URL Composio sends the browser back to."""
+    response = await http.post(f"/connect/{await seed_link(db, tenant_id)}")
+    assert response.status_code == 303
+    sent = urlsplit(linker.links[-1]["callback_url"])
+    return f"{sent.path}?{sent.query}&{param}={ACCOUNT_ID}"
+
+
+async def tenant_row(db: Database, tenant_id: UUID) -> Tenant:
+    async with db.tenant_session(TenantId(tenant_id)) as session:
+        tenant = await get_tenant(session, tenant_id)
+    assert tenant is not None
+    return tenant
+
+
+async def connections(db: Database, tenant_id: UUID) -> list[CalendarConnection]:
+    async with db.tenant_session(TenantId(tenant_id)) as session:
+        rows = await session.scalars(
+            select(CalendarConnection).order_by(CalendarConnection.connected_at)
+        )
+        return list(rows.all())
+
+
+class TestCallback:
+    async def test_it_binds_activates_and_defers_the_message(
+        self, http: AsyncClient, db: Database, linker: FakeConnectLinker, queue: FakeProcrastinate
+    ) -> None:
+        tenant_id = await seed_tenant(db, language="he")
+        url = await callback_url(http, db, linker, tenant_id)
+        linker.accounts[ACCOUNT_ID] = account(tenant_id)
+
+        response = await http.get(url)
+
+        assert response.status_code == 200
+        assert '<html lang="he" dir="rtl">' in response.text
+        assert_page(response, "connected", "he")
+        assert_hardened(response)
+        tenant = await tenant_row(db, tenant_id)
+        assert (tenant.status, tenant.onboarding_step) == ("active", None)
+        [connection] = await connections(db, tenant_id)
+        assert (
+            connection.connected_account_id,
+            connection.auth_config_id,
+            connection.status,
+            connection.composio_user_id,
+        ) == (ACCOUNT_ID, AUTH_CONFIG_ID, "active", str(tenant_id))
+        # Ids only (docs/adr/0001).
+        assert queue.calls == [
+            DeferredCall(
+                ONBOARDING_CONNECTED_TASK,
+                {},
+                {"tenant_id": str(tenant_id), "connection_id": str(connection.id)},
+            )
+        ]
+
+    async def test_composios_camel_case_parameter_works_too(
+        self, http: AsyncClient, db: Database, linker: FakeConnectLinker
+    ) -> None:
+        tenant_id = await seed_tenant(db)
+        url = await callback_url(http, db, linker, tenant_id, param="connectedAccountId")
+        linker.accounts[ACCOUNT_ID] = account(tenant_id)
+        assert (await http.get(url)).status_code == 200
+
+    async def test_a_refreshed_callback_sends_one_message(
+        self, http: AsyncClient, db: Database, linker: FakeConnectLinker, queue: FakeProcrastinate
+    ) -> None:
+        tenant_id = await seed_tenant(db, language="he")
+        await seed_inbound(db, tenant_id, channel="gowa", sent_at=datetime.now(UTC))
+        url = await callback_url(http, db, linker, tenant_id)
+        linker.accounts[ACCOUNT_ID] = account(tenant_id)
+
+        assert (await http.get(url)).status_code == 200
+        assert (await http.get(url)).status_code == 200
+
+        assert len(await connections(db, tenant_id)) == 1
+        assert len(queue.calls) == 2
+        assert queue.calls[0] == queue.calls[1]
+        gowa = FakeOutbound(name="gowa")
+        for call in queue.calls:  # what the worker does with each deferred job
+            await announce_connected(
+                UUID(call.kwargs["tenant_id"]),
+                UUID(call.kwargs["connection_id"]),
+                db=db,
+                channels={"gowa": gowa}.__getitem__,
+            )
+        assert [message.body for message in gowa.sent] == [t("all_set", "he")]
+
+    async def test_an_account_not_yet_active_can_be_reloaded(
+        self, http: AsyncClient, db: Database, linker: FakeConnectLinker, queue: FakeProcrastinate
+    ) -> None:
+        tenant_id = await seed_tenant(db)
+        url = await callback_url(http, db, linker, tenant_id)
+        linker.accounts[ACCOUNT_ID] = account(tenant_id, status="INITIATED")
+
+        first = await http.get(url)
+        assert first.status_code == 400
+        assert_page(first, "not_ready", "he", "en")
+        assert (await tenant_row(db, tenant_id)).status == "onboarding"
+        assert queue.calls == []
+
+        linker.accounts[ACCOUNT_ID] = account(tenant_id)
+        second = await http.get(url)
+        assert second.status_code == 200
+        assert_page(second, "connected", "he")
+
+    async def test_a_suspended_tenant_is_not_bound(
+        self, http: AsyncClient, db: Database, linker: FakeConnectLinker, queue: FakeProcrastinate
+    ) -> None:
+        tenant_id = await seed_tenant(db)
+        url = await callback_url(http, db, linker, tenant_id)
+        await suspend(db, tenant_id)
+        linker.accounts[ACCOUNT_ID] = account(tenant_id)
+
+        assert (await http.get(url)).status_code == 400
+        assert await connections(db, tenant_id) == []
+        assert (await tenant_row(db, tenant_id)).status == "suspended"
+        assert queue.calls == []
+
+    async def test_reconnecting_revokes_the_old_connection(
+        self, http: AsyncClient, db: Database, linker: FakeConnectLinker
+    ) -> None:
+        tenant_id = await seed_tenant(db)
+        async with db.tenant_session(TenantId(tenant_id)) as session:
+            await bind_connection(
+                session, tenant_id, connected_account_id="ca_old", auth_config_id=AUTH_CONFIG_ID
+            )
+        url = await callback_url(http, db, linker, tenant_id)
+        linker.accounts[ACCOUNT_ID] = account(tenant_id)
+
+        assert (await http.get(url)).status_code == 200
+
+        statuses = {c.connected_account_id: c.status for c in await connections(db, tenant_id)}
+        assert statuses == {"ca_old": "revoked", ACCOUNT_ID: "active"}
+
+    async def test_an_account_already_bound_to_another_tenant_is_refused(
+        self, http: AsyncClient, db: Database, linker: FakeConnectLinker, queue: FakeProcrastinate
+    ) -> None:
+        """Unreachable while D5's user_id check holds, but if it ever happens: a friendly
+        failure page, no activation, no job, and neither tenant changes."""
+        tenant_a = await seed_tenant(db, phone="972501110001")
+        tenant_b = await seed_tenant(db, phone="972501110002")
+        async with db.tenant_session(TenantId(tenant_b)) as session:
+            await bind_connection(
+                session, tenant_b, connected_account_id=ACCOUNT_ID, auth_config_id=AUTH_CONFIG_ID
+            )
+        before = await connections(db, tenant_b)
+        url = await callback_url(http, db, linker, tenant_a)
+        linker.accounts[ACCOUNT_ID] = account(tenant_a)
+
+        response = await http.get(url)
+
+        assert response.status_code == 409
+        assert_page(response, "failed", "he", "en")
+        assert_hardened(response)
+        assert (await tenant_row(db, tenant_a)).status == "onboarding"
+        assert await connections(db, tenant_a) == []
+        assert queue.calls == []
+        assert [(c.id, c.status) for c in await connections(db, tenant_b)] == [
+            (c.id, c.status) for c in before
+        ]
+
+    async def test_a_failed_defer_still_shows_connected(
+        self, connect_settings: Settings, db: Database, linker: FakeConnectLinker
+    ) -> None:
+        """The tenant is bound and active. The page says so, and a reload re-defers."""
+        application = connect_app(
+            connect_settings, db=db, linker=linker, queue=FailingProcrastinate()
+        )
+        transport = ASGITransport(app=application, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            tenant_id = await seed_tenant(db)
+            url = await callback_url(client, db, linker, tenant_id)
+            linker.accounts[ACCOUNT_ID] = account(tenant_id)
+            response = await client.get(url)
+
+        assert response.status_code == 200
+        assert (await tenant_row(db, tenant_id)).status == "active"

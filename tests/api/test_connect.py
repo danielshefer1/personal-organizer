@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Callable
+from urllib.parse import urlencode
+from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
@@ -16,12 +18,15 @@ from httpx import AsyncClient
 from itsdangerous import TimestampSigner
 
 from personal_organizer.api.app import create_app
+from personal_organizer.core.errors import CalendarProviderUnavailableError
 from personal_organizer.settings import Settings
 from tests.api.conftest import FakeDatabase, FakeProcrastinate
 from tests.fixtures.connect import (
+    ACCOUNT_ID,
     CONNECT_ENV,
     OTHER_SECRET,
     FakeConnectLinker,
+    account,
     assert_hardened,
     assert_page,
     connect_app,
@@ -106,3 +111,103 @@ class TestRefusedLinks:
     async def test_the_refusal_does_not_say_why(self, http: AsyncClient) -> None:
         bodies = {(await http.get(f"/connect/{make()}")).text for make in REFUSED_LINKS.values()}
         assert len(bodies) == 1
+
+
+def callback(state: str | None, account_id: str | None = ACCOUNT_ID) -> str:
+    params = {
+        name: value
+        for name, value in {"state": state, "connected_account_id": account_id}.items()
+        if value is not None
+    }
+    return f"/connect/callback?{urlencode(params)}"
+
+
+REFUSED_STATES: dict[str, Callable[[], str | None]] = {
+    "missing": lambda: None,
+    "garbage": lambda: "not-a-state",
+    "forged": lambda: state_token(secret=OTHER_SECRET),
+    "a_link_not_a_state": lambda: link_token(),
+    "expired": lambda: stale(state_token),
+}
+
+
+class TestCallbackRefusals:
+    """D5, everything decided before the tenant's rows are touched."""
+
+    @pytest.mark.parametrize("kind", sorted(REFUSED_STATES))
+    async def test_a_bad_state_is_refused_before_composio_is_asked(
+        self, http: AsyncClient, linker: FakeConnectLinker, queue: FakeProcrastinate, kind: str
+    ) -> None:
+        response = await http.get(callback(REFUSED_STATES[kind]()))
+        assert response.status_code == 400
+        assert_page(response, "failed", "he", "en")
+        assert_hardened(response)
+        assert linker.lookups == []
+        assert queue.calls == []
+
+    @pytest.mark.parametrize(
+        "account_id", [None, "", "../../admin", "ca_" + "x" * 65, "ac_test", "ca_a/b"]
+    )
+    async def test_a_malformed_account_id_never_reaches_composio(
+        self, http: AsyncClient, linker: FakeConnectLinker, account_id: str | None
+    ) -> None:
+        response = await http.get(callback(state_token(), account_id))
+        assert response.status_code == 400
+        assert linker.lookups == []
+
+    async def test_another_users_account_is_refused(
+        self, http: AsyncClient, linker: FakeConnectLinker, queue: FakeProcrastinate
+    ) -> None:
+        tenant_id = uuid4()
+        linker.accounts[ACCOUNT_ID] = account(tenant_id, user_id=str(uuid4()))
+        response = await http.get(callback(state_token(tenant_id)))
+        assert response.status_code == 400
+        assert_page(response, "failed", "he", "en")
+        assert linker.lookups == [ACCOUNT_ID]
+        assert queue.calls == []
+
+    async def test_an_account_under_another_auth_config_is_refused(
+        self, http: AsyncClient, linker: FakeConnectLinker, queue: FakeProcrastinate
+    ) -> None:
+        tenant_id = uuid4()
+        linker.accounts[ACCOUNT_ID] = account(tenant_id, auth_config_id="ac_someone_else")
+        response = await http.get(callback(state_token(tenant_id)))
+        assert response.status_code == 400
+        assert queue.calls == []
+
+    @pytest.mark.parametrize(
+        "status", ["INITIALIZING", "INITIATED", "FAILED", "EXPIRED", "INACTIVE", "REVOKED"]
+    )
+    async def test_an_account_that_is_not_active_is_not_bound(
+        self,
+        http: AsyncClient,
+        linker: FakeConnectLinker,
+        queue: FakeProcrastinate,
+        status: str,
+    ) -> None:
+        tenant_id = uuid4()
+        linker.accounts[ACCOUNT_ID] = account(tenant_id, status=status)
+        response = await http.get(callback(state_token(tenant_id)))
+        assert response.status_code == 400
+        assert_page(response, "not_ready", "he", "en")
+        assert queue.calls == []
+
+    async def test_an_account_composio_does_not_know_is_refused(self, http: AsyncClient) -> None:
+        response = await http.get(callback(state_token()))
+        assert response.status_code == 400
+        assert_page(response, "failed", "he", "en")
+
+    async def test_composio_unreachable_asks_for_a_reload(
+        self, http: AsyncClient, linker: FakeConnectLinker
+    ) -> None:
+        linker.failure = CalendarProviderUnavailableError("down")
+        response = await http.get(callback(state_token()))
+        assert response.status_code == 503
+        assert_page(response, "unavailable_retry", "he", "en")
+        assert_hardened(response)
+
+    async def test_the_callback_is_not_mistaken_for_a_link(self, http: AsyncClient) -> None:
+        """``/{token}`` would take "callback" as a token if it were declared first."""
+        response = await http.get("/connect/callback")
+        assert response.status_code == 400
+        assert_page(response, "failed", "he", "en")

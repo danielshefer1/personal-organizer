@@ -1,22 +1,29 @@
-"""The connect flow behind ``/connect``: open a link, then hand the browser to Composio.
+"""The connect flow behind ``/connect``: open a link, hand the browser to Composio, finish on
+the callback.
 
 D4: a link is spent on POST, never on GET, because WhatsApp fetches links to build previews.
 :func:`open_link` reads (the tenant's language and number, for the page) and writes nothing.
+
+D5: the callback believes Composio's API, not its query string. :func:`complete_connect`
+verifies our signed state, fetches the account and checks it before it binds anything.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Final
 from urllib.parse import urlencode
+from uuid import UUID
 
 from personal_organizer.core.errors import ConfigError
 from personal_organizer.core.types import TenantId
 from personal_organizer.db.engine import Database
+from personal_organizer.db.repositories.connections import bind_connection
 from personal_organizer.db.repositories.links import consume_link
-from personal_organizer.db.repositories.tenants import get_tenant, primary_phone
-from personal_organizer.interfaces.calendar import ConnectLinker
+from personal_organizer.db.repositories.tenants import activate, get_tenant, primary_phone
+from personal_organizer.interfaces.calendar import ACCOUNT_ACTIVE, ConnectLinker
 from personal_organizer.onboarding.tokens import (
     LINK_SALT,
     STATE_SALT,
@@ -32,6 +39,16 @@ _LINKABLE: Final = "onboarding"
 #: How many trailing digits of the number the page shows: enough for someone handed another
 #: person's link to see that it is not theirs before connecting their Google account to it.
 PHONE_SUFFIX_DIGITS: Final = 4
+#: A callback may land again (a reload) after the first one activated the tenant.
+_BINDABLE: Final = frozenset({"onboarding", "active"})
+#: How long a signed state stays good: the time a user may spend on Composio's and Google's
+#: screens, unverified-app warning included. Generous, because the state is not the authority
+#: (Composio's API is, D5), and a late callback can only bind what it verifies.
+STATE_MAX_AGE_S: Final = 3600
+#: Composio's connected-account ids. Checked before an id from the query reaches an API path.
+_ACCOUNT_ID = re.compile(r"\Aca_[A-Za-z0-9_-]{1,64}\Z")
+#: ``Refused.reason`` for an account another tenant already holds.
+ACCOUNT_CONFLICT: Final = "account_conflict"
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +85,22 @@ class ConnectConfig:
 class LinkPage:
     language: str
     phone_suffix: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class Connected:
+    tenant_id: UUID
+    connection_id: UUID
+    language: str
+
+
+@dataclass(frozen=True, slots=True)
+class Refused:
+    """Why a callback bound nothing: a fixed, log-safe word, never shown to the user.
+    ``tenant_id`` is set when the state was verified, so the caller may log it."""
+
+    reason: str
+    tenant_id: UUID | None = None
 
 
 def _link_payload(token: str, config: ConnectConfig) -> TokenPayload | None:
@@ -128,10 +161,68 @@ async def start_connect(
     )
 
 
+async def complete_connect(
+    *,
+    state: str | None,
+    connected_account_id: str | None,
+    db: Database,
+    linker: ConnectLinker,
+    config: ConnectConfig,
+) -> Connected | Refused:
+    """D5: verify our state, then believe only what Composio's API says about the account.
+
+    Everything that can refuse does so before a tenant row is touched, except the tenant's own
+    status. Binding and activating are one tenant transaction. Idempotent: the same callback
+    twice binds once (``bind_connection`` returns the existing row) and reports the same
+    connection id, so the jobs it defers send one message between them.
+
+    Raises :class:`~personal_organizer.core.errors.CalendarProviderError` from ``linker``.
+    """
+    payload = (
+        verify(state, secret=config.secret, salt=STATE_SALT, max_age_s=STATE_MAX_AGE_S)
+        if state
+        else None
+    )
+    if payload is None:
+        return Refused("bad_state")
+    if connected_account_id is None or not _ACCOUNT_ID.match(connected_account_id):
+        return Refused("bad_account_id")
+    account = await linker.get_account(connected_account_id)
+    tenant_id = payload.tenant_id
+    if account.user_id != str(tenant_id):
+        return Refused("user_mismatch")
+    if account.auth_config_id != config.auth_config_id:
+        return Refused("auth_config_mismatch")
+    if account.status != ACCOUNT_ACTIVE:
+        return Refused("not_active")
+    try:
+        async with db.tenant_session(TenantId(tenant_id)) as session:
+            tenant = await get_tenant(session, tenant_id)
+            if tenant is None or tenant.status not in _BINDABLE:
+                return Refused("tenant_unavailable")
+            connection = await bind_connection(
+                session,
+                tenant_id,
+                connected_account_id=account.id,
+                auth_config_id=account.auth_config_id,
+            )
+            await activate(session, tenant_id)
+    except LookupError:
+        # Another tenant holds this account. Caught outside the session so the whole
+        # transaction rolls back: no activation, and neither tenant's rows change.
+        return Refused(ACCOUNT_CONFLICT, tenant_id)
+    return Connected(tenant_id=tenant_id, connection_id=connection.id, language=tenant.language)
+
+
 __all__ = [
+    "ACCOUNT_CONFLICT",
     "PHONE_SUFFIX_DIGITS",
+    "STATE_MAX_AGE_S",
     "ConnectConfig",
+    "Connected",
     "LinkPage",
+    "Refused",
+    "complete_connect",
     "open_link",
     "start_connect",
 ]

@@ -15,6 +15,7 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 from personal_organizer.db.dsn import normalise
+from personal_organizer.db.engine import Database
 from personal_organizer.db.roles import DatabaseRole
 from personal_organizer.settings import Settings, WhatsAppSettings
 from tests.fixtures.payloads import APP_SECRET, PHONE_NUMBER_ID
@@ -87,6 +88,37 @@ async def clean_channel_tables(owner_conn: Any) -> AsyncIterator[None]:
         yield
     finally:
         await owner_conn.execute(f"TRUNCATE {_CHANNEL_TABLES} CASCADE")
+
+
+#: Every tenant table hangs off ``tenants`` with ``ON DELETE CASCADE``, so CASCADE from it
+#: empties them all -- and keeps doing so as tables are added.
+_TENANT_ROOT = "tenants"
+
+
+@pytest.fixture
+async def clean_tenant_tables(owner_conn: Any) -> AsyncIterator[None]:
+    """Empty every tenant table before and after a test.
+
+    TRUNCATE is not subject to row-level security, so the owner empties these tables even
+    though ``FORCE`` makes every SELECT, INSERT, UPDATE and DELETE of its own see nothing
+    without a tenant GUC.
+    """
+    await owner_conn.execute(f"TRUNCATE {_TENANT_ROOT} CASCADE")
+    try:
+        yield
+    finally:
+        await owner_conn.execute(f"TRUNCATE {_TENANT_ROOT} CASCADE")
+
+
+@pytest.fixture
+async def database(db_settings: Settings, owner_conn: Any) -> AsyncIterator[Database]:
+    """A :class:`Database` on the real settings. ``owner_conn`` supplies the skip."""
+    del owner_conn
+    db = Database(db_settings)
+    try:
+        yield db
+    finally:
+        await db.dispose()
 
 
 @pytest.fixture

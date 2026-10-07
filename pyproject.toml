@@ -63,6 +63,8 @@ dev = [
 target-version = "py314"
 line-length = 100
 src = ["src", "tests"]
+# Design and plan documents: their Python is illustration, not code to format or lint.
+extend-exclude = ["docs/superpowers"]
 
 [tool.ruff.lint]
 select = [

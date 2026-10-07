@@ -23,8 +23,8 @@ point:
 3. **WhatsApp opens links before people do.** To build a preview, it fetches every URL in a
    message, from the sender's phone or from WhatsApp's servers. A connect link that does
    something on GET is used up, or acted on, by a robot.
-4. **Composio's callback arrives as a browser redirect.** Its query string (connected account
-   id, status) passes through the user's browser, so anyone can type it. A callback that
+4. **Composio's callback arrives as a browser redirect.** Its query string (the connected account
+   id, our `state`) passes through the user's browser, so anyone can type it. A callback that
    believed it would let a person bind someone else's Google account to their tenant, or
    bind a failed connection.
 
@@ -42,6 +42,10 @@ point:
        (`create_tenant: identity vanished`) rather than return NULL, and the Python wrapper
        raises `RuntimeError` if a NULL ever reaches it, so a `None` can never become a
        `tenant_session(None)`.
+   - The definer holds only what they need: `USAGE, CREATE` on `public` (bootstrap, for
+     `ALTER FUNCTION … OWNER TO`) and `SELECT, INSERT` on `tenants` and `tenant_identities`
+     (migration 0004). `app_user`'s `EXECUTE` comes from bootstrap's default privileges on
+     functions; a test pins that nobody else has it.
    - They return an id and nothing else. Everything after that runs in
      `tenant_session(tid)`, under RLS like the rest of the code. The two calls themselves run
      in `Database.system_session()`, as `app_user`.
@@ -69,9 +73,17 @@ point:
      then spends the link with one atomic
      `UPDATE onboarding_links SET used_at = now WHERE used_at IS NULL AND expires_at > now`,
      then answers 303 to Composio. The signature proves we issued the link; `used_at` makes it
-     single-use; `ONBOARDING__LINK_TTL_S` bounds how long it can be spent. A token stays
-     *recognised* for 30 days, so that a late tap gets "already connected" or "ask for a new
-     link" rather than a bare error.
+     single-use; `ONBOARDING__LINK_TTL_S` bounds how long it can be spent.
+   - GET checks only the signature and the tenant's status. POST (`consume_link`) is the
+     authority on use and expiry, and an active tenant's POST does not spend the link.
+   - POST spends the link *before* calling Composio. If Composio then fails, the user gets the
+     503 `unavailable_new_link` page and must ask the bot for a new link. That is deliberate:
+     a double tap produces one redirect, not two.
+   - A token stays *recognised* for 30 days (`RECOGNISED_MAX_AGE_S`), but that changes the
+     outcome only for a tenant who is already active, who sees "already connected". For anyone
+     else, an expired link gets the same 410 `link_unusable` page as a forged one. The callback
+     `state` is recognised for 30 days in the same way (`_late`), so a connected tenant
+     reloading an old callback tab sees "connected".
    - The page sends `Referrer-Policy: no-referrer`, `Cache-Control: no-store` and
      `Content-Security-Policy: default-src 'none'` (an inline stylesheet, by hash, and a form
      action are allowed back in; no external asset, no script).
@@ -141,14 +153,18 @@ point:
   (a later iteration) will have to delete its Composio connected accounts by that id.
 - Rotating `ONBOARDING__LINK_SECRET` invalidates every outstanding link and in-flight
   callback. That costs a user one fresh link, and nothing else.
-- **A reconnect leaves the superseded Composio account `ACTIVE`.** We create links with
+- **Superseded and orphaned Composio accounts stay `ACTIVE`.** We create links with
   `allow_multiple=True`, because Composio's default refuses a user who already has an `ACTIVE`
-  account, and a tenant whose first attempt reached `ACTIVE` but whose callback never arrived
-  would be stuck for good. `bind_connection` then marks the old `calendar_connections` row
-  `revoked`, so a tenant has at most one active row. The old account is still `ACTIVE` at
-  Composio, holding Google tokens. **The calendar-read iteration must name the bound
-  `connected_account_id` on every call, never "the user's account", and revoking one of our
-  rows must also disable or delete that account at Composio.**
+  account, and a tenant whose first attempt reached `ACTIVE` at Composio but whose callback
+  never arrived would be stuck for good. The common result is an **unbound** `ACTIVE` account
+  at Composio, holding Google tokens, with no `calendar_connections` row at all. A revoked row
+  is the rare case: there is no reconnect flow yet (an active tenant's link gets "already
+  connected"), so the only revoke today is a second account bound by a callback arriving
+  within the state's hour, when `bind_connection` marks the old row `revoked`. Either way a
+  tenant has at most one active row, but Composio may hold more accounts than we do.
+  **The calendar-read iteration must name the bound `connected_account_id` on every call,
+  never "the user's account", and must disable or delete superseded or orphaned accounts
+  (revoking one of our rows should do so too).**
 - Merging two tenants (a person on WhatsApp and, later, on Telegram) is not supported. It
   will need its own linking flow, not a change to the identity key.
 
@@ -157,5 +173,5 @@ point:
 Recorded from `docs/runbook-iteration-03.md` section 6 once they are run: whether the
 connect link passes Google's unverified-app screen and returns `ACTIVE`; the names of the
 callback's query parameters (`connected_account_id` or `connectedAccountId`) and that `state`
-survives the round trip; what a reconnect does; and whether the SDK logs request bodies or
+survives the round trip; what a second connect attempt does; and whether the SDK logs request bodies or
 sends telemetry.

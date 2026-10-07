@@ -12,8 +12,10 @@ the invite list know. Two consequences:
 - Found by ``tel:`` while the message also carried a ``uid:`` (a Meta BSUID arriving for a
   number first seen on the gateway): the ``uid:`` key is added to that tenant, so their next
   message resolves even with no number in it.
-- A new tenant is created on the strongest key, and the others are added at once. Enrolling
-  through Meta and writing later through the gateway is therefore still one person.
+- A new tenant is created on the ``tel:`` key when the sender has a phone (the strongest key
+  otherwise), and every key not yet recorded is linked at once. Enrolling through Meta and
+  writing later through the gateway is therefore still one person. A key owned by another
+  tenant is skipped and logged as ``tenant.identity_conflict``.
 
 Resolution and creation run as ``app_user`` through the two ``SECURITY DEFINER`` functions
 (D1). The worker cannot read ``tenant_identities`` before it knows the tenant, by design.

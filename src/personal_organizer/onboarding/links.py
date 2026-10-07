@@ -3,7 +3,7 @@
 A link is a signed token (:mod:`.tokens`) over the tenant id and a random nonce, plus an
 ``onboarding_links`` row that makes it single-use and bounds it to ``ONBOARDING__LINK_TTL_S``.
 Every message in the ``connect`` step re-sends a link, so links are **reused**: the newest
-unused one is sent again, as long as at least half its life remains. A link with seconds
+unused one is sent again, as long as more than half its life remains. A link with seconds
 left would expire while the user switches to the browser and signs in to Google. Only then
 is a fresh one issued. A user who writes five times holds one live link, not five.
 

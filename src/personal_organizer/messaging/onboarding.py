@@ -54,7 +54,7 @@ ZONE_STEP: Final = "zone"
 CONNECT_STEP: Final = "connect"
 
 #: Both languages, whatever the tenant's: people answer in the language they think in.
-_CORRECT_ALIASES: Final = ("yes", "y", "ok", "correct", "right", "כן", "נכון")
+_CORRECT_ALIASES: Final = ("yes", "y", "ok", "correct", "right", "כן", "נכון", "👍")
 _CHANGE_ALIASES: Final = ("no", "n", "change", "wrong", "לא", "לשנות", "שנה")
 
 

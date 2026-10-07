@@ -23,9 +23,12 @@ person stays served after their number is removed from it.
 That happens in the one transaction that finishes the row, together with whatever state the
 onboarding step decided: ``channel_inbox`` is not an RLS table, so the tenant-scoped session
 that writes ``messages`` can update it too, and the step's change, the copy, the nulling and
-``processed_at`` commit or roll back as one. Nothing a known tenant writes outlives the job
-outside RLS. Strangers' messages are purged as before. So are those of an invited number
-whose first message came too late to answer, since there is no tenant to keep them under.
+``processed_at`` commit or roll back as one. For a job that finishes, nothing a known tenant
+writes outlives it outside RLS. A job that exhausts its retries leaves the body in
+``channel_inbox`` until it is processed (retention is Iteration 12's audit item). Strangers'
+messages are purged as before. So are those of an invited number whose first message came too
+late to answer, since there is no tenant to keep them under. The transaction claims the row
+first (``processed_at IS NULL``), so an overlapping retry writes nothing.
 
 **Re-runs.** ``processed_at`` ends a re-run early and every reply goes through
 :func:`send_once`. A job that dies after its sends and before that transaction re-runs from
@@ -136,6 +139,17 @@ async def _finish_known(
     row, together with the state the onboarding step decided."""
     change = advance or Advance()
     async with db.tenant_session(TenantId(tenant_id)) as session:
+        # Claim the row first. ``messages.inbox_id`` is not unique, so an overlapping retry that
+        # loaded the row before this one committed must find it finished and write nothing.
+        finished = await session.scalar(
+            update(ChannelInbox)
+            .where(ChannelInbox.id == row.id, ChannelInbox.processed_at.is_(None))
+            .values(processed_at=func.now(), disposition=disposition, **_PURGED)
+            .returning(ChannelInbox.id)
+        )
+        if finished is None:
+            log.info("inbound.already_processed", inbox_id=str(row.id))
+            return
         if change.timezone is not None:
             await set_timezone(session, tenant_id, change.timezone)
         if change.next_step is not None:
@@ -149,16 +163,13 @@ async def _finish_known(
             body=row.body,
             sent_at=row.sent_at,
         )
-        await session.execute(
-            update(ChannelInbox)
-            .where(ChannelInbox.id == row.id)
-            .values(processed_at=func.now(), disposition=disposition, **_PURGED)
-        )
 
 
 async def acknowledge(row: InboxRow, channel: OutboundChannel, *, db: Database) -> None:
     """Iteration 02's ``on_allowed``: the fixed acknowledgement. Iteration 04 replaces it."""
-    if row.sender_phone is None:  # pragma: no cover - allowlisting requires a phone
+    if row.sender_phone is None:
+        # An active tenant who writes with a BSUID and no number reaches here (the tenant gate
+        # does not need a phone). Until Iteration 04 there is no reply to such a sender.
         return
     await send_once(
         db,

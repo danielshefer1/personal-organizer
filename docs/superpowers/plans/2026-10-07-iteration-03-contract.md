@@ -186,9 +186,11 @@ are authoritative for detail.
   - It owns the `clean_tenant_tables` and `database` fixtures. PR 3 uses PR 2's fixture and does
     not define its own.
 - **PR 3**
-  - Appends `add_identity(session, tenant_id, *, network, external_id, phone) -> None` to
-    `db/repositories/tenants.py`, and **must add a matching case to `tests/db/test_isolation.py`**.
+  - Appends `add_identity(session, tenant_id, *, network, external_id, phone) -> bool` (`True`
+    if a row was inserted) to `db/repositories/tenants.py`, and **must add a matching case to `tests/db/test_isolation.py`**.
   - `handle_inbound` gains `settings: Settings | None = None`.
+  - `enrol` creates the tenant on the `tel:` key when the sender has a phone (the strongest key
+    otherwise) and links every missing key (controller ruling, Task 7).
   - `InboxRow` moves to `messaging/inbox.py`, re-exported from `messaging/inbound.py`.
   - Link expiry is decided by the `onboarding_links` row, never by the token's timestamp. A resend
     signs a fresh token for the same nonce.

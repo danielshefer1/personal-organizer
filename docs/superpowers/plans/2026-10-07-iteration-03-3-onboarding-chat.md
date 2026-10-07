@@ -15,8 +15,9 @@
 None. Everything the contract lists for PR 3 keeps its name, module and signature. This plan adds some things the contract leaves open, all of them additive:
 
 - `handle_inbound(..., settings: Settings | None = None, ...)`. The contract says onboarding runs only when `settings.composio.enabled` but does not say how the settings arrive. An explicit keyword keeps the function testable without patching. `None` (every existing caller and test) means Iteration 02 exactly.
-- `add_identity(session, tenant_id, *, network, external_id, phone) -> None` is appended to PR 2's `db/repositories/tenants.py`. D12 says the worker adds a `uid:` row for a phone-keyed tenant, and no PR 2 function inserts an identity for an existing tenant.
+- `add_identity(session, tenant_id, *, network, external_id, phone) -> bool` (`True` if a row was inserted) is appended to PR 2's `db/repositories/tenants.py`. D12 says the worker adds a `uid:` row for a phone-keyed tenant, and no PR 2 function inserts an identity for an existing tenant.
 - `InboxRow` moves to the new module `messaging/inbox.py`, together with a public `load_row`. `messaging/inbound.py` re-exports `InboxRow` and keeps it in `__all__`, so `tests/db/test_handle_inbound.py` is untouched. `InboxRow` gains `sender_user_id` and `reply_id`.
+- `enrol` creates the tenant on the `tel:` key when the sender has a phone (the strongest key otherwise) and links all missing keys (controller ruling, Task 7), so racing first messages on two channels meet at one `create_tenant` call.
 - D12's "`resolve_tenant` tries `uid:` first, then `tel:`" is done by the caller (`messaging/tenancy.py`). The contract's SQL function takes one `external_id`, so the worker calls it once per key, strongest first.
 
 ## Global Constraints

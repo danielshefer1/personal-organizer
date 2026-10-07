@@ -159,6 +159,7 @@ class TestZoneStep:
             ("yes!", None),
             ("כן", None),
             ("נכון", None),
+            ("👍", None),
             ("1. Correct", ZONE_CORRECT),  # a GOWA selection, or a Meta button
         ],
     )

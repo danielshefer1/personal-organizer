@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import io
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -28,11 +28,12 @@ from personal_organizer.db.repositories.tenants import resolve_tenant
 from personal_organizer.interfaces.channel import OutboundChannel, OutboundMessage
 from personal_organizer.messaging import inbound
 from personal_organizer.messaging.inbound import InboxRow, acknowledge, handle_inbound
-from personal_organizer.messaging.onboarding import welcome_text
+from personal_organizer.messaging.inbox import load_row
+from personal_organizer.messaging.onboarding import Advance, welcome_text
 from personal_organizer.messaging.onboarding_text import t
 from personal_organizer.messaging.replies import ACK_TEXT, INVITE_ONLY_TEXT
 from personal_organizer.observability.logging import configure_logging
-from personal_organizer.settings import Settings
+from personal_organizer.settings import ComposioSettings, Settings
 from tests.fixtures.channels import FakeOutbound, Spy, insert_inbox
 from tests.fixtures.tenants import (
     BASE_URL,
@@ -221,6 +222,8 @@ class TestComposioOff:
         self, db: Database, owner_conn: Any, db_settings: Settings
     ) -> None:
         """Before Composio is configured, invited senders keep the acknowledgement."""
+        # Whatever the developer's .env says, Composio is off here.
+        off = db_settings.model_copy(update={"composio": ComposioSettings()})
         channel = FakeOutbound(name="gowa")
         inbox_id = await insert_inbox(owner_conn)
 
@@ -233,12 +236,26 @@ class TestComposioOff:
             channels={"gowa": channel}.__getitem__,
             allowlist=INVITED,
             on_allowed=ack,
-            settings=db_settings,
+            settings=off,
         )
         assert disposition == "allowed"
         assert channel.sent == [OutboundMessage(recipient=NL_PHONE, body=ACK_TEXT)]
         assert await tenant_by_phone(db, NL_PHONE) is None
         assert (await _inbox(owner_conn, inbox_id))["body"] == "hi"
+
+
+class TestAcknowledge:
+    async def test_a_bsuid_only_active_tenant_gets_no_acknowledgement(
+        self, db: Database, owner_conn: Any, db_settings: Settings
+    ) -> None:
+        """Pinned until Iteration 04: with no number to address, there is no reply."""
+        channel = FakeOutbound(name="gowa")
+        inbox_id = await insert_inbox(owner_conn, phone=None, user_id="US.1")
+        row = await load_row(db, inbox_id)
+        assert row is not None
+        await acknowledge(row, channel, db=db)
+        assert channel.sent == []
+        assert channel.attempts == []
 
 
 class TestStrangers:
@@ -391,6 +408,30 @@ class TestReRuns:
         assert len(person.gowa.sent) == 2
         assert await _kinds(person.conn) == ["onboarding:welcome_zone", "onboarding:connect"]
         assert len(await messages_of(db, tenant.id)) == 2
+
+    async def test_an_overlapping_retry_records_and_advances_once(
+        self, person: Person, db: Database
+    ) -> None:
+        """Two jobs that both loaded the row before either finished: the second to commit
+        finds ``processed_at`` set, and writes nothing."""
+        await person.say("hi")
+        await person.say("1")
+        assert person.last is not None
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        row = await load_row(db, person.last)
+        assert row is not None
+        # The state both overlapping jobs saw: a stale in-memory row, the step still ``zone``.
+        stale = replace(row, processed_at=None, disposition=None)
+        assert len(await messages_of(db, tenant.id)) == 2
+
+        await inbound._finish_known(
+            db, stale, tenant.id, "onboarding", Advance(timezone="Asia/Jerusalem")
+        )
+        assert len(await messages_of(db, tenant.id)) == 2
+        after = await tenant_by_phone(db, NL_PHONE)
+        assert after is not None
+        assert (after.onboarding_step, after.timezone) == ("connect", "Europe/Amsterdam")
 
     async def test_a_finished_row_is_a_no_op(self, person: Person) -> None:
         await person.say("hi")

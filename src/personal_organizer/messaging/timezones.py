@@ -76,6 +76,11 @@ _ALIASES: Final[Mapping[str, str]] = MappingProxyType(
         "tel aviv": "Asia/Jerusalem",
         "tel aviv yafo": "Asia/Jerusalem",
         "israel": "Asia/Jerusalem",
+        "haifa": "Asia/Jerusalem",
+        "beer sheva": "Asia/Jerusalem",
+        "beersheba": "Asia/Jerusalem",
+        "be'er sheva": "Asia/Jerusalem",
+        "eilat": "Asia/Jerusalem",
         # Two zones share these last segments; both are the same clock.
         "istanbul": "Europe/Istanbul",
         "nicosia": "Asia/Nicosia",

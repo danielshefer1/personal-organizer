@@ -24,6 +24,7 @@ from itsdangerous import BadData, URLSafeTimedSerializer
 
 LINK_SALT: Final = "po.onboarding.link"
 STATE_SALT: Final = "po.onboarding.state"
+MAX_TOKEN_LENGTH: Final = 1024  # real tokens are ~150 characters
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +43,8 @@ def sign(payload: TokenPayload, *, secret: str, salt: str) -> str:
 
 def verify(token: str, *, secret: str, salt: str, max_age_s: int) -> TokenPayload | None:
     """The payload of a token we signed under ``salt`` within ``max_age_s``, else ``None``."""
+    if not isinstance(token, str) or len(token) > MAX_TOKEN_LENGTH:
+        return None  # never decode or HMAC what cannot be ours; never raise
     try:
         data = _serializer(secret, salt).loads(token, max_age=max_age_s)
     except BadData:  # bad signature, expired, undecodable: all the same to the caller
@@ -58,4 +61,4 @@ def verify(token: str, *, secret: str, salt: str, max_age_s: int) -> TokenPayloa
     return TokenPayload(tenant_id=tenant_id, nonce=nonce)
 
 
-__all__ = ["LINK_SALT", "STATE_SALT", "TokenPayload", "sign", "verify"]
+__all__ = ["LINK_SALT", "MAX_TOKEN_LENGTH", "STATE_SALT", "TokenPayload", "sign", "verify"]

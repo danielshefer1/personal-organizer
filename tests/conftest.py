@@ -8,9 +8,11 @@ test suite from implying a guarantee the regex layer cannot make.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Iterator
 
 import pytest
+from structlog._config import BoundLoggerLazyProxy
 
 from personal_organizer.settings import Settings
 
@@ -41,6 +43,24 @@ _BASE_ENV: dict[str, str] = {
     "MODELS__TRANSCRIPTION_MODEL": "gpt-4o-mini-transcribe",
     "LOGGING__PII_PEPPER": "test-pepper",
 }
+
+
+@pytest.fixture(autouse=True)
+def _uncached_module_loggers() -> Iterator[None]:
+    """Forget each module logger's cached configuration after every test.
+
+    structlog caches a module's ``log`` on first use together with the processor list current
+    at that moment. A test that calls ``configure_logging`` installs a new list, so a logger
+    first used before it keeps the old one, and a later ``capture_logs()`` -- which edits the
+    current list in place -- never sees that logger's events. Clearing the cache makes every
+    test's first use bind to the configuration that test runs under.
+    """
+    yield
+    for name, module in list(sys.modules.items()):
+        if name.startswith("personal_organizer"):
+            proxy = getattr(module, "log", None)
+            if isinstance(proxy, BoundLoggerLazyProxy):
+                proxy.__dict__.pop("bind", None)
 
 
 @pytest.fixture

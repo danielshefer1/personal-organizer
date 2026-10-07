@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from personal_organizer.core.types import TenantId
 from personal_organizer.db.engine import Database
 from personal_organizer.db.models.tenant import NETWORK_WHATSAPP
+from personal_organizer.db.repositories.invites import mark_used
 from personal_organizer.db.repositories.messages import latest_inbound_channel
 from personal_organizer.db.repositories.tenants import (
     add_identity,
@@ -135,6 +136,10 @@ async def enrol(db: Database, row: InboxRow, *, language: str) -> UUID:
     different channels must meet at the same ``create_tenant`` call, whose race-safety is on
     one key. Creating on ``uid:`` here would let both win and split the person in two. The
     remaining keys are then linked.
+
+    An open invite for the number is marked used in the transaction that creates the
+    tenant (ADR 0006), so the two commit together; a re-run or a racing first message finds
+    nothing open and logs nothing.
     """
     network = network_for(row.channel)
     keys = identity_keys(row)
@@ -147,6 +152,9 @@ async def enrol(db: Database, row: InboxRow, *, language: str) -> UUID:
             phone=row.sender_phone,
             language=language,
         )
+        used = row.sender_phone is not None and await mark_used(session, row.sender_phone)
+    if used:
+        log.info("invite.used", tenant_id=str(tenant_id))
     rest = tuple(key for key in keys if key != first)
     if rest:
         await _link(db, tenant_id, row, rest)

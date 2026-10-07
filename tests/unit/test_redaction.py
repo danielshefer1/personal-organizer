@@ -6,18 +6,22 @@ This is the mechanised form of Iteration 01's "logs contain no raw PII".
 from __future__ import annotations
 
 import json
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
 import pytest
 
+from personal_organizer.observability import redaction
 from personal_organizer.observability.redaction import (
     CONTENT_KEYS,
     FORBIDDEN_KEYS,
+    MAX_SCAN,
     MAX_STR,
     OPAQUE_ID_KEYS,
     SAFE_KEYS,
     SECRET_KEYS,
+    TRUNCATED,
     Unredacted,
     hash_identifier,
     redact_event,
@@ -252,3 +256,83 @@ class TestConnectUrls:
     def test_an_encoded_account_id_is_kept(self) -> None:
         scrubbed = scrub_text("x%2Fcb%3Fstate%3Dabc%26connected_account_id%3Dca_1")
         assert scrubbed.endswith("%26connected_account_id%3Dca_1")
+
+
+#: Inputs shaped to make a backtracking regex try every start against every end. Outsiders
+#: reach scrub_text through X-Request-ID and the path of an unmatched route.
+ADVERSARIAL: dict[str, str] = {
+    "word_run": "a" * 100_000,
+    "call_prefix_run": "x[1](" * 20_000,
+    "dotted_run": "a." * 50_000,
+    "dashed_run": "a-" * 50_000,
+    "mixed_run": "AB12" * 25_000,
+    "email_prefix_run": "a.b%" * 25_000,
+}
+#: "Well under a second". The fixed code takes a few milliseconds; the old, quadratic, 28 s.
+BUDGET_S = 0.25
+
+
+def _timed(fn: Any, value: str) -> float:
+    started = perf_counter()
+    fn(value)
+    return perf_counter() - started
+
+
+class TestBoundedCost:
+    """scrub_text runs on the event loop for every log line and every Sentry event."""
+
+    @pytest.mark.parametrize("name", sorted(ADVERSARIAL))
+    def test_adversarial_input_is_scrubbed_quickly(self, name: str) -> None:
+        assert _timed(scrub_text, ADVERSARIAL[name]) < BUDGET_S
+
+    @pytest.mark.parametrize("name", sorted(ADVERSARIAL))
+    def test_the_call_string_rule_is_linear_by_itself(self, name: str) -> None:
+        """The cap below bounds every rule, but the call-string rule must not need it."""
+        assert _timed(redaction._drop_call_args, ADVERSARIAL[name] * 4) < BUDGET_S
+
+    def test_input_past_the_scan_window_is_dropped_and_marked(self) -> None:
+        scrubbed = scrub_text("ok " * 10 + "x" * (MAX_SCAN * 10))
+        assert scrubbed == "ok " * 10 + "...<truncated>"
+
+    def test_a_value_cut_at_the_window_leaves_no_partial_identifier(self) -> None:
+        """Cutting can split a phone number into a run too short for the phone rule. The
+        args rule then shrinks the text, so the piece would land inside MAX_STR."""
+        value = "j:t[1](" + "x" * (MAX_SCAN - 30) + ") phone +31612345678 tail"
+        assert len(value) > MAX_SCAN
+        scrubbed = scrub_text(value)
+        assert "3161" not in scrubbed
+        assert scrubbed.endswith("...<truncated>")
+
+    def test_short_values_carry_no_marker(self) -> None:
+        assert scrub_text("all good") == "all good"
+
+    def test_a_value_with_no_whitespace_past_the_window_keeps_only_the_marker(self) -> None:
+        assert scrub_text("a" * (MAX_SCAN + 1)) == TRUNCATED
+
+
+class TestCallStrings:
+    """Procrastinate logs Job.call_string, task kwargs included (docs/adr/0001)."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (
+                "Job channel:handle_inbound[123](inbox_id='9b1d') ended",
+                "Job channel:handle_inbound[123](<redacted:args>) ended",
+            ),
+            (
+                "onboarding:connected[7](tenant_id='a', connection_id='b')",
+                "onboarding:connected[7](<redacted:args>)",
+            ),
+            (
+                "Starting job webhooks.handle-x[9](body='Oncology') now",
+                "Starting job webhooks.handle-x[9](<redacted:args>) now",
+            ),
+            ("a[1](x) and b:c[22](y=1)", "a[1](<redacted:args>) and b:c[22](<redacted:args>)"),
+        ],
+    )
+    def test_the_arguments_are_dropped(self, value: str, expected: str) -> None:
+        assert scrub_text(value) == expected
+
+    def test_text_without_a_call_string_survives(self) -> None:
+        assert scrub_text("list[1] (not a call)") == "list[1] (not a call)"

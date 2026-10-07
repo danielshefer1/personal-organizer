@@ -33,6 +33,13 @@ from hashlib import sha256
 from typing import Any, Final
 
 MAX_STR: Final = 512
+#: How much of a value the rules below ever see. Outsiders choose some logged values (an
+#: ``X-Request-ID``, a path), and every log line and Sentry event runs this on the event loop:
+#: the cap bounds the work per value whatever a rule's worst case. Four times ``MAX_STR``
+#: leaves room for the rules to shrink the text (a call string's dropped arguments) and still
+#: fill the ``MAX_STR`` that is kept.
+MAX_SCAN: Final = 4 * MAX_STR
+TRUNCATED: Final = "...<truncated>"
 MAX_DEPTH: Final = 4
 MAX_ITEMS: Final = 50
 
@@ -235,7 +242,10 @@ _HEX_SHAPE = re.compile(r"\A[0-9a-fA-F]{16,64}\Z")
 # straight into its log messages at INFO and ERROR. Those kwargs carry user content, and
 # no content-detecting regex can save us there, so the argument list is dropped wholesale.
 # The architectural counterpart is in docs/adr/0001: task kwargs carry ids, never content.
-_CALL_STRING = re.compile(r"([\w.:-]+\[\d+\])\([^)]*\)")
+# Only the head is a regex, anchored by the lookbehind to the start of a name, so each name is
+# tried once. The closing parenthesis is found with str.find in _drop_call_args: as a regex,
+# ``\([^)]*\)`` would scan to the end of the text for every unclosed head, which is quadratic.
+_CALL_STRING = re.compile(r"(?<![\w.:-])([\w.:-]+\[\d+\])\(")
 
 # Onboarding links carry a bearer token in their path (/connect/<token>), and Composio's
 # callback our signed state in its query (?state=<token>). The token rules below would catch
@@ -274,13 +284,46 @@ def _sub_digit_run(match: re.Match[str]) -> str:
     return raw
 
 
+def _drop_call_args(value: str) -> str:
+    """``name[id](anything)`` becomes ``name[id](<redacted:args>)``, in linear time.
+
+    Up to the first ``)``, as Procrastinate's repr'd kwargs may hold any character. Once no
+    ``)`` is left, no later head can close either, so the scan stops.
+    """
+    parts: list[str] = []
+    position = 0
+    while (head := _CALL_STRING.search(value, position)) is not None:
+        close = value.find(")", head.end())
+        if close < 0:
+            break
+        parts.extend((value[position : head.start()], head.group(1), "(<redacted:args>)"))
+        position = close + 1
+    parts.append(value[position:])
+    return "".join(parts)
+
+
+def _scan_window(value: str) -> tuple[str, bool]:
+    """The part of ``value`` the rules see, and whether anything was cut.
+
+    The cut may split a phone number or a token into a piece too short for its rule, so the
+    last whitespace-separated word of the window goes too. With no whitespace, nothing is kept.
+    """
+    if len(value) <= MAX_SCAN:
+        return value, False
+    window = value[:MAX_SCAN]
+    boundary = max(window.rfind(" "), window.rfind("\n"), window.rfind("\t"))
+    return window[: boundary + 1], True
+
+
 def scrub_text(value: str) -> str:
     """Remove PII-shaped substrings and cap the length.
 
     The length cap is load-bearing on its own: it means a transcript or a file body cannot
-    land in a log line even if some future key is allowlisted by mistake.
+    land in a log line even if some future key is allowlisted by mistake. Only the first
+    :data:`MAX_SCAN` characters are scrubbed at all, which bounds the cost (see there).
     """
-    value = _CALL_STRING.sub(r"\1(<redacted:args>)", value)
+    value, truncated = _scan_window(value)
+    value = _drop_call_args(value)
     value = _CONNECT_TOKEN.sub(r"\1<redacted:link>", value)
     value = _STATE_PARAM.sub(r"\1<redacted:state>", value)
     value = _JWT.sub("<redacted:jwt>", value)
@@ -289,8 +332,8 @@ def scrub_text(value: str) -> str:
     value = _DIGITS_RUN.sub(_sub_digit_run, value)
     value = _LONG_TOKEN.sub("<redacted:token>", value)
     if len(value) > MAX_STR:
-        value = value[:MAX_STR] + "...<truncated>"
-    return value
+        value, truncated = value[:MAX_STR], True
+    return value + TRUNCATED if truncated else value
 
 
 @dataclass(frozen=True)
@@ -415,10 +458,12 @@ __all__ = [
     "CONTENT_KEYS",
     "FORBIDDEN_KEYS",
     "HASH_KEYS",
+    "MAX_SCAN",
     "MAX_STR",
     "OPAQUE_ID_KEYS",
     "SAFE_KEYS",
     "SECRET_KEYS",
+    "TRUNCATED",
     "Unredacted",
     "hash_identifier",
     "is_opaque_id",

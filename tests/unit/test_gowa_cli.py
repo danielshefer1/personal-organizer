@@ -124,3 +124,31 @@ def test_hash_matches_the_meta_cli(gowa_settings: Settings, capsys: Any, monkeyp
         capsys.readouterr().out.strip()
         == f"sender_hash={sender_hash(gowa_settings, '+31612345678')}"
     )
+
+
+class TestStatusSharesTheHealthCheck:
+    """``status`` and the worker's ``system:gowa_health`` read the gateway through one
+    function, so the operator's check and the alert cannot disagree."""
+
+    def test_a_wrong_password_names_the_status(self, gowa_settings: Settings, capsys: Any) -> None:
+        client, _ = _client(lambda _r: httpx.Response(401))
+        assert status(gowa_settings, client=client) == 1
+        assert "failed: HTTP 401" in capsys.readouterr().out
+
+    def test_reconnecting_is_a_failing_exit_code(
+        self, gowa_settings: Settings, capsys: Any
+    ) -> None:
+        client, _ = _client(TestStatus._status(False, True))
+        assert status(gowa_settings, client=client) == 1
+        out = capsys.readouterr().out
+        assert "connected=False logged_in=True" in out
+        assert "scan the QR code" not in out
+
+    def test_strings_are_not_booleans(self, gowa_settings: Settings, capsys: Any) -> None:
+        client, _ = _client(
+            lambda _r: httpx.Response(
+                200, json={"results": {"is_connected": "true", "is_logged_in": "false"}}
+            )
+        )
+        assert status(gowa_settings, client=client) == 1
+        assert "unexpected response" in capsys.readouterr().out

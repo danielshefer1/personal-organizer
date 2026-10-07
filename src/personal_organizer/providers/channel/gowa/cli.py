@@ -7,7 +7,8 @@
 
 ``status``
     Ask the gateway whether its WhatsApp session is connected and logged in -- the first
-    thing to check when replies stop (docs/runbook-whatsapp-gateway.md).
+    thing to check when replies stop (docs/runbook-whatsapp-gateway.md). The worker's
+    ``system:gowa_health`` task asks the same question every five minutes (``status.py``).
 
 ``hash``
     Print the ``sender_hash`` a phone number appears under in the logs, given the target's
@@ -27,8 +28,8 @@ from typing import Any
 import httpx
 
 from personal_organizer.core.phone import normalise_e164
-from personal_organizer.providers.channel.gowa.outbound import DEVICE_HEADER
 from personal_organizer.providers.channel.gowa.parser import MESSAGE_EVENT, phone_jid
+from personal_organizer.providers.channel.gowa.status import Unhealthy, check_status_sync
 from personal_organizer.providers.channel.hmac_sha256 import SIGNATURE_HEADER, sign
 from personal_organizer.providers.channel.whatsapp.cli import sender_hash
 from personal_organizer.settings import Settings, get_settings
@@ -97,28 +98,20 @@ def status(settings: Settings, *, client: httpx.Client) -> int:
     if gowa.basic_auth_user is None or gowa.basic_auth_password is None:
         _out("GOWA__BASIC_AUTH_USER and GOWA__BASIC_AUTH_PASSWORD must be set")
         return 2
-    try:
-        response = client.get(
-            f"{gowa.base_url}/app/status",
-            auth=(gowa.basic_auth_user, gowa.basic_auth_password.get_secret_value()),
-            headers={DEVICE_HEADER: gowa.device_id} if gowa.device_id else {},
-        )
-    except httpx.HTTPError as exc:
-        _out(f"unreachable: {type(exc).__name__} at {gowa.base_url}")
+    health = check_status_sync(client, gowa)
+    if health.reason is Unhealthy.UNREACHABLE:
+        _out(f"unreachable: {health.error_type} at {gowa.base_url}")
         return 1
-    if not response.is_success:
-        _out(f"failed: HTTP {response.status_code}")
+    if health.reason is Unhealthy.BAD_RESPONSE:
+        if health.status_code is not None:
+            _out(f"failed: HTTP {health.status_code}")
+        else:
+            _out("failed: unexpected response from the gateway")
         return 1
-    try:
-        results = response.json()["results"]
-        connected, logged_in = results["is_connected"], results["is_logged_in"]
-    except ValueError, KeyError, TypeError:
-        _out("failed: unexpected response from the gateway")
-        return 1
-    _out(f"connected={connected} logged_in={logged_in}")
-    if not logged_in:
+    _out(f"connected={health.connected} logged_in={health.logged_in}")
+    if health.reason is Unhealthy.NOT_LOGGED_IN:
         _out("not logged in: open the gateway's UI and scan the QR code from the bot's phone")
-    return 0 if connected and logged_in else 1
+    return 0 if health.ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:

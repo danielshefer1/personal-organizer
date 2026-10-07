@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from personal_organizer.core.errors import ChannelError, TransientChannelError
 from personal_organizer.interfaces.channel import OutboundChannel, OutboundMessage
-from personal_organizer.messaging.inbound import InboxRow
+from personal_organizer.messaging.inbox import InboxRow
 from tests.fixtures.payloads import SENDER_PHONE
 
 

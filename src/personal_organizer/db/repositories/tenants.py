@@ -11,6 +11,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from sqlalchemy import Uuid, func, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from personal_organizer.db.models.tenant import Tenant, TenantIdentity
@@ -85,8 +86,24 @@ async def primary_phone(session: AsyncSession, tenant_id: UUID) -> str | None:
     return phone
 
 
+async def add_identity(
+    session: AsyncSession, tenant_id: UUID, *, network: str, external_id: str, phone: str | None
+) -> None:
+    """Record another key for a known tenant (D12). A no-op when the key is already recorded.
+
+    Run inside ``tenant_session(tenant_id)``: the policy's ``WITH CHECK`` is what stops a key
+    from being attached to anyone else.
+    """
+    await session.execute(
+        insert(TenantIdentity)
+        .values(tenant_id=tenant_id, network=network, external_id=external_id, phone=phone)
+        .on_conflict_do_nothing(index_elements=["network", "external_id"])
+    )
+
+
 __all__ = [
     "activate",
+    "add_identity",
     "create_tenant",
     "get_tenant",
     "primary_phone",

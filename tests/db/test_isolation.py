@@ -38,6 +38,7 @@ from sqlalchemy.exc import DBAPIError
 from personal_organizer.core.types import TenantId
 from personal_organizer.db import repositories
 from personal_organizer.db.engine import Database
+from personal_organizer.db.models.tenant import NETWORK_WHATSAPP
 from personal_organizer.db.repositories import connections, links, messages, tenants
 from tests.db.tenant_tables import tenant_tables
 
@@ -252,8 +253,11 @@ async def test_updates_through_every_repository_function_leave_b_alone(
         lambda s, b: messages.record_inbound(
             s, b, inbox_id=uuid4(), channel="gowa", message_type="text", body="x", sent_at=NOW
         ),
+        lambda s, b: tenants.add_identity(
+            s, b, network=NETWORK_WHATSAPP, external_id="uid:new-b", phone=None
+        ),
     ],
-    ids=["create_link", "bind_connection", "record_inbound"],
+    ids=["create_link", "bind_connection", "record_inbound", "add_identity"],
 )
 async def test_inserts_for_b_under_a_are_refused(
     database: Database,

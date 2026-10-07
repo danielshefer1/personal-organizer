@@ -18,7 +18,6 @@ who writes to two of our numbers is told once.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final
 from uuid import UUID
@@ -30,6 +29,7 @@ from personal_organizer.core.errors import ChannelError
 from personal_organizer.db.engine import Database
 from personal_organizer.db.models.channel import ChannelInbox, ChannelOutbox
 from personal_organizer.interfaces.channel import OutboundChannel
+from personal_organizer.messaging.inbox import InboxRow, load_row
 from personal_organizer.messaging.outbox import send_once
 from personal_organizer.messaging.replies import (
     ACK_TEXT,
@@ -49,37 +49,6 @@ INVITE_ONLY: Final = "invite_only"
 _MUTING_STATUSES: Final = ("sending", "unknown", "accepted", "sent", "delivered", "read")
 
 
-@dataclass(frozen=True, slots=True)
-class InboxRow:
-    """A snapshot of the row, read once at the start of the job."""
-
-    id: UUID
-    channel: str
-    provider_message_id: str
-    sender_key: str
-    sender_phone: str | None
-    message_type: str
-    body: str | None
-    sent_at: datetime
-    processed_at: datetime | None
-    disposition: str | None
-
-    @classmethod
-    def of(cls, row: ChannelInbox) -> InboxRow:
-        return cls(
-            id=row.id,
-            channel=row.channel,
-            provider_message_id=row.provider_message_id,
-            sender_key=row.sender_key,
-            sender_phone=row.sender_phone,
-            message_type=row.message_type,
-            body=row.body,
-            sent_at=row.sent_at,
-            processed_at=row.processed_at,
-            disposition=row.disposition,
-        )
-
-
 #: The handoff for an allowed sender, given the channel to answer on.
 OnAllowed = Callable[[InboxRow, OutboundChannel], Awaitable[None]]
 
@@ -89,12 +58,6 @@ ChannelResolver = Callable[[str], OutboundChannel]
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
-
-
-async def _load(db: Database, inbox_id: UUID) -> InboxRow | None:
-    async with db.system_session() as session:
-        row = await session.get(ChannelInbox, inbox_id)
-        return InboxRow.of(row) if row is not None else None
 
 
 async def _already_told(db: Database, row: InboxRow, now: datetime) -> bool:
@@ -168,7 +131,7 @@ async def handle_inbound(
     now: Callable[[], datetime] = _utcnow,
 ) -> str | None:
     """Process one inbox row. Returns its disposition, or ``None`` if the row is gone."""
-    row = await _load(db, inbox_id)
+    row = await load_row(db, inbox_id)
     if row is None:
         log.warning("inbound.missing", inbox_id=str(inbox_id))
         return None

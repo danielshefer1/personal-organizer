@@ -13,7 +13,7 @@ from starlette.status import HTTP_422_UNPROCESSABLE_CONTENT, HTTP_500_INTERNAL_S
 
 from personal_organizer import __version__
 from personal_organizer.api.lifespan import make_lifespan
-from personal_organizer.api.middleware import RequestContextMiddleware
+from personal_organizer.api.middleware import UNMATCHED_ROUTE, RequestContextMiddleware
 from personal_organizer.api.routers import connect, health, internal, webhooks
 from personal_organizer.providers.channel.gowa.inbound import GowaInbound
 from personal_organizer.providers.channel.whatsapp.inbound import WhatsAppInbound
@@ -25,6 +25,13 @@ log = structlog.get_logger(__name__)
 def _request_id(request: Request) -> str:
     bound: dict[str, Any] = structlog.contextvars.get_contextvars()
     return str(bound.get("request_id", "")) or request.headers.get("x-request-id", "")
+
+
+def _route_template(request: Request) -> str:
+    """The matched route's template, never the path: the caller chose the path, and path
+    parameters carry identifiers. The access log does the same (``api.middleware``)."""
+    route: Any = request.scope.get("route")
+    return str(getattr(route, "path", UNMATCHED_ROUTE))
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -71,7 +78,7 @@ def create_app(settings: Settings) -> FastAPI:
             "request.invalid",
             error_type="RequestValidationError",
             error_count=len(exc.errors()),
-            path=request.url.path,
+            route=_route_template(request),
         )
         return JSONResponse(
             status_code=HTTP_422_UNPROCESSABLE_CONTENT,

@@ -6,11 +6,12 @@ from time import perf_counter
 from uuid import uuid4
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from httpx import AsyncClient
 from structlog.testing import capture_logs
 
 from personal_organizer import __version__
+from personal_organizer.api.app import _route_template
 from personal_organizer.api.middleware import UNMATCHED_ROUTE
 from personal_organizer.observability.logging import configure_logging
 from personal_organizer.settings import Settings
@@ -105,3 +106,27 @@ class TestRequestContext:
         started = perf_counter()
         await client.get("/" + "a" * 60_000, headers={"x-request-id": "a" * 65_536})
         assert perf_counter() - started < 1.0
+
+
+class TestInvalidRequests:
+    async def test_an_invalid_request_logs_its_route_not_its_path(
+        self, app: FastAPI, client: AsyncClient
+    ) -> None:
+        """request.invalid used to log the raw path, which the caller chose."""
+
+        @app.get("/items/{item_id}")
+        async def item(item_id: int) -> dict[str, int]:
+            return {"item_id": item_id}
+
+        odd = "Dana%20Levi%20+31612345678" + "x[1](" * 2_000
+        with capture_logs() as logs:
+            response = await client.get(f"/items/{odd}")
+        assert response.status_code == 422
+        [entry] = [entry for entry in logs if entry["event"] == "request.invalid"]
+        assert entry["route"] == "/items/{item_id}"
+        assert "path" not in entry
+        assert all("Dana" not in str(e) and "x[1](x[1](" not in str(e) for e in logs)
+
+    async def test_the_route_is_a_fixed_marker_when_none_matched(self) -> None:
+        request = Request({"type": "http", "method": "GET", "path": "/odd", "headers": []})
+        assert _route_template(request) == UNMATCHED_ROUTE

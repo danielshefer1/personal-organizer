@@ -284,19 +284,24 @@ def _sub_digit_run(match: re.Match[str]) -> str:
     return raw
 
 
+#: What a phone number may be written with: the characters of ``_DIGITS_RUN``, plus ``+``.
+_NUMBER_CHARS: Final = "0123456789+()-. \t\n\r\f\v"
+
+
 def _drop_call_args(value: str) -> str:
     """``name[id](anything)`` becomes ``name[id](<redacted:args>)``, in linear time.
 
-    Up to the first ``)``, as Procrastinate's repr'd kwargs may hold any character. Once no
-    ``)`` is left, no later head can close either, so the scan stops.
+    Up to the first ``)``, as Procrastinate's repr'd kwargs may hold any character. A head
+    with no ``)`` after it drops everything after it: its arguments run past the text, which
+    is what happens when :func:`_scan_window` cuts a long call string short.
     """
     parts: list[str] = []
     position = 0
     while (head := _CALL_STRING.search(value, position)) is not None:
+        parts.extend((value[position : head.start()], head.group(1), "(<redacted:args>)"))
         close = value.find(")", head.end())
         if close < 0:
-            break
-        parts.extend((value[position : head.start()], head.group(1), "(<redacted:args>)"))
+            return "".join(parts)
         position = close + 1
     parts.append(value[position:])
     return "".join(parts)
@@ -307,12 +312,14 @@ def _scan_window(value: str) -> tuple[str, bool]:
 
     The cut may split a phone number or a token into a piece too short for its rule, so the
     last whitespace-separated word of the window goes too. With no whitespace, nothing is kept.
+    A number written in groups (``+31 6 1234 5678``) spans words, so a trailing run of number
+    characters goes as well. ``rstrip``, not a regex: it is linear.
     """
     if len(value) <= MAX_SCAN:
         return value, False
     window = value[:MAX_SCAN]
     boundary = max(window.rfind(" "), window.rfind("\n"), window.rfind("\t"))
-    return window[: boundary + 1], True
+    return window[: boundary + 1].rstrip(_NUMBER_CHARS), True
 
 
 def scrub_text(value: str) -> str:

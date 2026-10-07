@@ -292,7 +292,7 @@ class TestBoundedCost:
 
     def test_input_past_the_scan_window_is_dropped_and_marked(self) -> None:
         scrubbed = scrub_text("ok " * 10 + "x" * (MAX_SCAN * 10))
-        assert scrubbed == "ok " * 10 + "...<truncated>"
+        assert scrubbed == ("ok " * 10).rstrip() + TRUNCATED
 
     def test_a_value_cut_at_the_window_leaves_no_partial_identifier(self) -> None:
         """Cutting can split a phone number into a run too short for the phone rule. The
@@ -302,6 +302,19 @@ class TestBoundedCost:
         scrubbed = scrub_text(value)
         assert "3161" not in scrubbed
         assert scrubbed.endswith("...<truncated>")
+
+    def test_a_space_formatted_phone_cut_at_the_window_leaves_no_digits(self) -> None:
+        """The word drop leaves "+31 6 1234 " when the cut falls inside the last group: seven
+        digits, below the phone rule's threshold. Trailing number characters go too."""
+        head = "j:t[1](" + "x" * 10
+        tail = ") phone +31 6 1234 "
+        pad = "y" * (MAX_SCAN - 2 - len(head) - len(tail))
+        value = head + pad + tail + "5678 more text"
+        assert value[MAX_SCAN - 2 : MAX_SCAN] == "56"  # the cut splits the last group
+        scrubbed = scrub_text(value)
+        assert "1234" not in scrubbed
+        assert "+31" not in scrubbed
+        assert scrubbed.endswith(TRUNCATED)
 
     def test_short_values_carry_no_marker(self) -> None:
         assert scrub_text("all good") == "all good"
@@ -333,6 +346,31 @@ class TestCallStrings:
     )
     def test_the_arguments_are_dropped(self, value: str, expected: str) -> None:
         assert scrub_text(value) == expected
+
+    def test_arguments_running_past_the_window_are_dropped(self) -> None:
+        """The window ends inside the arguments, so no ``)`` follows the head in it."""
+        value = (
+            "Job channel:handle_inbound[7](text='Dear doctor, my name is Dana Levi and my "
+            "diagnosis is " + "secret " * 400 + "') ended with status: succeeded"
+        )
+        assert len(value) > MAX_SCAN
+        scrubbed = scrub_text(value)
+        assert scrubbed == "Job channel:handle_inbound[7](<redacted:args>)" + TRUNCATED
+
+    @pytest.mark.parametrize("offset", [-3, -2, -1, 0, 1])
+    def test_arguments_straddling_the_cut_are_dropped(self, offset: int) -> None:
+        """The ``)`` just inside the window (where the word drop may take it), on the cut, or
+        just past it: whichever, no argument text survives."""
+        start = "Job channel:handle_inbound[7](text='Dana Levi "
+        args = (start + "secret " * MAX_SCAN)[: MAX_SCAN + offset]
+        value = args + ")" + " after" * 400
+        scrubbed = scrub_text(value)
+        assert scrubbed.startswith("Job channel:handle_inbound[7](<redacted:args>)")
+        assert "Dana" not in scrubbed
+        assert "secret" not in scrubbed
+
+    def test_an_unclosed_call_string_drops_the_rest(self) -> None:
+        assert scrub_text("Job a:b[1](text='Dana Levi") == "Job a:b[1](<redacted:args>)"
 
     def test_text_without_a_call_string_survives(self) -> None:
         assert scrub_text("list[1] (not a call)") == "list[1] (not a call)"

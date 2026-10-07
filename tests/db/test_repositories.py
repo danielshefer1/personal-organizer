@@ -8,21 +8,27 @@ answers nothing should go. Isolation between tenants is ``test_isolation.py``'s 
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.exc import IntegrityError
 
 from personal_organizer.core.types import TenantId
 from personal_organizer.db.engine import Database
-from personal_organizer.db.models.tenant import NETWORK_WHATSAPP, TenantIdentity
-from personal_organizer.db.repositories import tenants
+from personal_organizer.db.models.tenant import (
+    NETWORK_WHATSAPP,
+    CalendarConnection,
+    TenantIdentity,
+)
+from personal_organizer.db.repositories import connections, links, messages, tenants
 
 pytestmark = [pytest.mark.db, pytest.mark.usefixtures("clean_tenant_tables")]
 
 PHONE = "+972501234567"
 KEY = f"tel:{PHONE}"
+NOW = datetime(2026, 10, 8, 9, 0, tzinfo=UTC)
 
 
 async def _create(database: Database, *, key: str = KEY, phone: str | None = PHONE) -> UUID:
@@ -30,6 +36,18 @@ async def _create(database: Database, *, key: str = KEY, phone: str | None = PHO
         return await tenants.create_tenant(
             session, network=NETWORK_WHATSAPP, external_id=key, phone=phone, language="he"
         )
+
+
+async def _inbox(owner_conn: Any, *, channel: str = "gowa") -> UUID:
+    inbox_id: UUID = await owner_conn.fetchval(
+        "INSERT INTO channel_inbox (channel, provider_message_id, sender_key, sender_phone, "
+        "message_type, sent_at) VALUES ($1, $2, $3, $4, 'text', now()) RETURNING id",
+        channel,
+        f"repo.{uuid4().hex}",
+        KEY,
+        PHONE,
+    )
+    return inbox_id
 
 
 # --- tenants ------------------------------------------------------------------------------
@@ -142,3 +160,159 @@ async def test_primary_phone_is_the_earliest_identity_with_one(database: Databas
         )
     async with database.tenant_session(TenantId(tenant_id)) as session:
         assert await tenants.primary_phone(session, tenant_id) == PHONE
+
+
+# --- links --------------------------------------------------------------------------------
+
+
+async def test_consume_link_is_single_use(database: Database) -> None:
+    tenant_id = await _create(database)
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        await links.create_link(
+            session, tenant_id, nonce="n-1", expires_at=NOW + timedelta(minutes=30)
+        )
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        assert await links.consume_link(session, tenant_id, nonce="n-1", now=NOW) is True
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        assert await links.consume_link(session, tenant_id, nonce="n-1", now=NOW) is False
+        assert await links.consume_link(session, tenant_id, nonce="n-other", now=NOW) is False
+
+
+async def test_concurrent_consumes_have_one_winner(database: Database) -> None:
+    """Two POSTs of the same connect page, e.g. a double tap."""
+    tenant_id = await _create(database)
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        await links.create_link(session, tenant_id, nonce="n-1", expires_at=NOW + timedelta(1))
+
+    async def consume() -> bool:
+        async with database.tenant_session(TenantId(tenant_id)) as session:
+            return await links.consume_link(session, tenant_id, nonce="n-1", now=NOW)
+
+    assert sorted(await asyncio.gather(*(consume() for _ in range(4)))) == [
+        False,
+        False,
+        False,
+        True,
+    ]
+
+
+async def test_an_expired_link_cannot_be_consumed(database: Database) -> None:
+    tenant_id = await _create(database)
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        await links.create_link(session, tenant_id, nonce="n-1", expires_at=NOW)
+        # Expiry is exclusive: a link is dead at its expires_at.
+        assert await links.consume_link(session, tenant_id, nonce="n-1", now=NOW) is False
+
+
+async def test_latest_usable_link(database: Database) -> None:
+    tenant_id = await _create(database)
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        assert await links.latest_usable_link(session, tenant_id, now=NOW) is None
+        await links.create_link(session, tenant_id, nonce="old", expires_at=NOW + timedelta(1))
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        await links.create_link(session, tenant_id, nonce="new", expires_at=NOW + timedelta(1))
+        await links.create_link(session, tenant_id, nonce="dead", expires_at=NOW)
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        link = await links.latest_usable_link(session, tenant_id, now=NOW)
+        assert link is not None
+        assert link.nonce == "new"
+        assert await links.consume_link(session, tenant_id, nonce="new", now=NOW)
+        link = await links.latest_usable_link(session, tenant_id, now=NOW)
+        assert link is not None
+        assert link.nonce == "old"
+
+
+# --- connections --------------------------------------------------------------------------
+
+
+async def test_bind_connection_revokes_the_previous_one(database: Database) -> None:
+    tenant_id = await _create(database)
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        first = await connections.bind_connection(
+            session, tenant_id, connected_account_id="ca_1", auth_config_id="ac_1"
+        )
+        assert (first.status, first.composio_user_id) == ("active", str(tenant_id))
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        second = await connections.bind_connection(
+            session, tenant_id, connected_account_id="ca_2", auth_config_id="ac_1"
+        )
+        previous = await session.get(CalendarConnection, first.id, populate_existing=True)
+        assert previous is not None
+        assert (previous.status, second.status) == ("revoked", "active")
+
+
+async def test_bind_connection_is_idempotent_on_the_account(database: Database) -> None:
+    """The callback delivered twice: one row, still active, nothing revoked."""
+    tenant_id = await _create(database)
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        first = await connections.bind_connection(
+            session, tenant_id, connected_account_id="ca_1", auth_config_id="ac_1"
+        )
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        again = await connections.bind_connection(
+            session, tenant_id, connected_account_id="ca_1", auth_config_id="ac_1"
+        )
+        assert (again.id, again.status) == (first.id, "active")
+
+
+async def test_concurrent_binds_of_one_account_make_one_row(
+    database: Database, owner_conn: Any
+) -> None:
+    tenant_id = await _create(database)
+
+    async def bind() -> UUID:
+        async with database.tenant_session(TenantId(tenant_id)) as session:
+            row = await connections.bind_connection(
+                session, tenant_id, connected_account_id="ca_1", auth_config_id="ac_1"
+            )
+            return row.id
+
+    assert len(set(await asyncio.gather(bind(), bind()))) == 1
+    async with owner_conn.transaction():
+        await owner_conn.execute("SELECT set_config('app.tenant_id', $1, true)", str(tenant_id))
+        assert await owner_conn.fetchval("SELECT count(*) FROM calendar_connections") == 1
+
+
+# --- messages -----------------------------------------------------------------------------
+
+
+async def test_latest_inbound_channel_follows_the_newest_message(
+    database: Database, owner_conn: Any
+) -> None:
+    tenant_id = await _create(database)
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        assert await messages.latest_inbound_channel(session, tenant_id) is None
+        for channel, minutes in (("whatsapp", 1), ("gowa", 2)):
+            await messages.record_inbound(
+                session,
+                tenant_id,
+                inbox_id=await _inbox(owner_conn, channel=channel),
+                channel=channel,
+                message_type="text",
+                body="hello",
+                sent_at=NOW + timedelta(minutes=minutes),
+            )
+        assert await messages.latest_inbound_channel(session, tenant_id) == "gowa"
+
+
+async def test_record_inbound_survives_the_inbox_row(database: Database, owner_conn: Any) -> None:
+    """``inbox_id`` is ``ON DELETE SET NULL``: the ledger may be pruned, content stays."""
+    tenant_id = await _create(database)
+    inbox_id = await _inbox(owner_conn)
+    async with database.tenant_session(TenantId(tenant_id)) as session:
+        message_id = await messages.record_inbound(
+            session,
+            tenant_id,
+            inbox_id=inbox_id,
+            channel="gowa",
+            message_type="text",
+            body="hello",
+            sent_at=NOW,
+        )
+    await owner_conn.execute("DELETE FROM channel_inbox WHERE id = $1", inbox_id)
+    async with owner_conn.transaction():
+        await owner_conn.execute("SELECT set_config('app.tenant_id', $1, true)", str(tenant_id))
+        row = await owner_conn.fetchrow(
+            "SELECT inbox_id, body, direction FROM messages WHERE id = $1", message_id
+        )
+    assert dict(row) == {"inbox_id": None, "body": "hello", "direction": "in"}

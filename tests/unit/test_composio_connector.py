@@ -26,7 +26,7 @@ from personal_organizer.core.errors import (
     CalendarProviderUnavailableError,
 )
 from personal_organizer.interfaces.calendar import ConnectedAccount, ConnectLinker
-from personal_organizer.providers.calendar.composio import ComposioConnector
+from personal_organizer.providers.calendar.composio import SDK_LIMITER, ComposioConnector
 from personal_organizer.settings import ComposioSettings
 
 API = "https://backend.composio.dev"
@@ -241,3 +241,35 @@ class TestQuiet:
         connector(Api({}))
         assert logging.getLogger("composio_client").getEffectiveLevel() >= logging.WARNING
         assert logging.getLogger("composio").getEffectiveLevel() >= logging.WARNING
+
+
+class TestFixRound1:
+    async def test_the_sdks_error_is_not_chained_into_ours(self) -> None:
+        body = {"error": {"message": "DISTINCTIVE-BODY-TEXT for user"}}
+        api = Api({account_route("ca_x"): lambda: httpx.Response(400, json=body, headers=NO_RETRY)})
+        with pytest.raises(CalendarProviderRejectedError) as raised:
+            await connector(api).get_account("ca_x")
+        err = raised.value
+        assert err.__cause__ is None
+        assert err.__suppress_context__ is True
+        assert "DISTINCTIVE" not in str(err)
+        assert "DISTINCTIVE" not in repr(err)
+
+    async def test_a_record_without_an_auth_config_is_rejected(self) -> None:
+        body = {"id": "ca_new", "user_id": TENANT, "status": "ACTIVE"}
+        api = Api({account_route("ca_new"): lambda: httpx.Response(200, json=body)})
+        with pytest.raises(CalendarProviderRejectedError) as raised:
+            await connector(api).get_account("ca_new")
+        assert raised.value.status_code is None
+        assert raised.value.__cause__ is None
+
+    async def test_calls_borrow_the_connectors_own_limiter(self) -> None:
+        seen: list[int] = []
+
+        def watch(request: httpx.Request) -> httpx.Response:
+            seen.append(SDK_LIMITER.borrowed_tokens)
+            return retrieved()()
+
+        await connector(watch).get_account("ca_new")
+        assert seen == [1]
+        assert SDK_LIMITER.borrowed_tokens == 0

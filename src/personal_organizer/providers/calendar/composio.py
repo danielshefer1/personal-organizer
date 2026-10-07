@@ -51,6 +51,10 @@ from personal_organizer.settings import ComposioSettings
 _TRANSIENT_STATUSES: Final = frozenset({408, 409, 429})
 #: One retry, for a quick 5xx. A slow failure uses up the deadline before a retry could finish.
 _SDK_MAX_RETRIES: Final = 1
+#: Worker threads for SDK calls. A call past its deadline is abandoned, not killed, and keeps its
+#: thread until the SDK gives up. Sharing anyio's default pool (40) would let a slow Composio
+#: starve every other thread user, so the connector gets its own, small, pool.
+SDK_LIMITER: Final = anyio.CapacityLimiter(4)
 
 
 def _untracked[T](fn: Callable[[], T]) -> T:
@@ -102,12 +106,15 @@ class ComposioConnector:
             with anyio.fail_after(self._timeout_s):
                 # abandon_on_cancel: past the deadline the request is left to finish on its
                 # thread rather than holding the caller.
-                return await anyio.to_thread.run_sync(_untracked, fn, abandon_on_cancel=True)
+                return await anyio.to_thread.run_sync(
+                    _untracked, fn, abandon_on_cancel=True, limiter=SDK_LIMITER
+                )
         except TimeoutError:
             # Ours (fail_after), or the SDK's ComposioSDKTimeoutError, which is also one.
             raise CalendarProviderUnavailableError("Calendar provider timed out") from None
         except (composio_client.ComposioError, composio_exceptions.ComposioError) as exc:
-            raise _translate(exc) from exc
+            # No chaining: the SDK's message is the response body, and Sentry sends __cause__.
+            raise _translate(exc) from None
 
     async def link(self, *, user_id: str, auth_config_id: str, callback_url: str) -> str:
         request = await self._call(
@@ -125,12 +132,15 @@ class ComposioConnector:
         record = await self._call(
             lambda: self._sdk.connected_accounts.get(nanoid=connected_account_id)
         )
-        return ConnectedAccount(
-            id=str(record.id),
-            user_id=str(record.user_id),
-            auth_config_id=str(record.auth_config.id),
-            status=str(record.status),
-        )
+        try:
+            return ConnectedAccount(
+                id=str(record.id),
+                user_id=str(record.user_id),
+                auth_config_id=str(record.auth_config.id),
+                status=str(record.status),
+            )
+        except AttributeError, TypeError:
+            raise CalendarProviderRejectedError(None) from None
 
 
 __all__ = ["ComposioConnector", "ConnectedAccount"]

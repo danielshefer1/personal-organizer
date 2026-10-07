@@ -32,3 +32,8 @@ htmlcov/
 *.swp
 .idea/
 .vscode/
+
+# Claude
+.claude/
+.remember/
+

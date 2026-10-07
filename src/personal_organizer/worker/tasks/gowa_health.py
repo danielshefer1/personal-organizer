@@ -48,6 +48,9 @@ def _report(reason: Unhealthy, health: GatewayHealth) -> None:
         scope.set_tag("reason", reason.value)
         if health.status_code is not None:
             scope.set_tag("status_code", str(health.status_code))
+        if health.error_type is not None:
+            # The class name only, never the message: it says what is wrong (``InvalidURL``).
+            scope.set_tag("error_type", health.error_type)
         sentry_sdk.capture_message("gowa.unhealthy", level="error")
 
 
@@ -55,9 +58,12 @@ async def _ask(gowa: GowaSettings, client: httpx.AsyncClient) -> GatewayHealth:
     try:
         return await check_status(client, gowa)
     except (httpx.InvalidURL, ValueError) as exc:
-        # A malformed base URL or non-Latin-1 credentials: httpx raises before sending
-        # anything. The gateway cannot be asked, which is as bad as it being down. Record
-        # the class only: ``InvalidURL``'s message quotes the URL.
+        # The gateway cannot be asked, which is as bad as it being down: a malformed base
+        # URL, a non-Latin-1 header such as GOWA__DEVICE_ID (httpx raises before sending
+        # anything), or the unset-credential ValueError. Record the class only:
+        # ``InvalidURL``'s message quotes the URL.
+        return GatewayHealth(Unhealthy.BAD_RESPONSE, error_type=type(exc).__name__)
+    except Exception as exc:  # logging events are off: an escaping error would never alarm
         return GatewayHealth(Unhealthy.BAD_RESPONSE, error_type=type(exc).__name__)
 
 

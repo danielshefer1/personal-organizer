@@ -192,6 +192,7 @@ class TestUnhealthy:
         assert all(event["level"] == "error" for event in events)
         assert all(event["fingerprint"] == list(SENTRY_FINGERPRINT) for event in events)
         assert [event["tags"]["reason"] for event in events] == ["unreachable", "not_logged_in"]
+        assert [event["tags"].get("error_type") for event in events] == ["ConnectError", None]
 
     async def test_the_password_never_leaves(
         self, gowa_settings: Settings, log_stream: io.StringIO
@@ -233,9 +234,35 @@ class TestConfigurationErrors:
         (event,) = events
         assert event["message"] == "gowa.unhealthy"
         assert event["fingerprint"] == list(SENTRY_FINGERPRINT)
+        assert event["tags"]["reason"] == "bad_response"
+        assert event["tags"]["error_type"] == error_type
         for leaked in ("bad host", "secret", "dév"):
             assert leaked not in log_stream.getvalue()
             assert leaked not in json.dumps(events, default=str)
+
+
+class TestUnexpectedErrors:
+    """Logging events are off, so an exception escaping the task would never reach Sentry."""
+
+    async def test_any_other_exception_still_alarms_without_its_message(
+        self, gowa_settings: Settings, log_stream: io.StringIO
+    ) -> None:
+        def explode(_request: httpx.Request) -> httpx.Response:
+            msg = "boom-secret-detail"
+            raise RuntimeError(msg)
+
+        with sentry_events() as events:
+            await _run(gowa_settings, explode)
+        (line,) = [entry for entry in _lines(log_stream) if entry["event"] == "gowa.unhealthy"]
+        assert line["reason"] == "bad_response"
+        assert line["error_type"] == "RuntimeError"
+        (event,) = events
+        assert event["message"] == "gowa.unhealthy"
+        assert event["fingerprint"] == list(SENTRY_FINGERPRINT)
+        assert event["tags"]["reason"] == "bad_response"
+        assert event["tags"]["error_type"] == "RuntimeError"
+        assert "boom-secret-detail" not in log_stream.getvalue()
+        assert "boom-secret-detail" not in json.dumps(events, default=str)
 
 
 class TestHealthy:

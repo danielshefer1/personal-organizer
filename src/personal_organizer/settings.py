@@ -26,7 +26,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from personal_organizer.core.errors import MissingDatabaseRoleError
 from personal_organizer.core.phone import normalise_e164
-from personal_organizer.db.roles import DatabaseRole
+from personal_organizer.db.roles import DEFINER_ROLE_NAME, DatabaseRole
 
 Environment = Literal["local", "ci", "staging", "production"]
 Component = Literal["api", "worker", "cli"]
@@ -400,7 +400,8 @@ class Settings(BaseSettings):
         """
         if role is DatabaseRole.DEFINER:
             raise MissingDatabaseRoleError(
-                role.value, reason="app_definer is NOLOGIN; it owns functions, nothing connects"
+                role.value,
+                reason=f"{DEFINER_ROLE_NAME} is NOLOGIN; it owns functions, nothing connects",
             )
         value: SecretStr | None = getattr(self.database, f"{role.value}_url", None)
         if value is None:

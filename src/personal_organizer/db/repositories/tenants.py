@@ -39,7 +39,12 @@ async def create_tenant(
     result = await session.execute(
         select(func.create_tenant(network, external_id, phone, language, type_=Uuid()))
     )
-    tenant_id: UUID = result.scalar_one()
+    tenant_id: UUID | None = result.scalar_one()
+    if tenant_id is None:
+        # The SQL function guards this itself; this keeps a None from ever reaching
+        # tenant_session. No identifiers in the message (no PII).
+        msg = "create_tenant returned no tenant id"
+        raise RuntimeError(msg)
     return tenant_id
 
 

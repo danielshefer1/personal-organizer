@@ -96,6 +96,14 @@ BEGIN
     EXCEPTION WHEN unique_violation THEN
         SELECT tenant_id INTO v_tenant FROM tenant_identities
         WHERE network = p_network AND external_id = p_external_id;
+        -- Never hand back NULL. Under READ COMMITTED the winner's committed row is always
+        -- visible here, so this guard is unreachable and no test exercises it; it exists for
+        -- REPEATABLE READ/SERIALIZABLE callers, or a winner deleted in between, who would
+        -- otherwise get a NULL tenant id that silently sets no GUC downstream.
+        IF v_tenant IS NULL THEN
+            RAISE EXCEPTION 'create_tenant: identity vanished'
+                USING ERRCODE = 'serialization_failure';
+        END IF;
         RETURN v_tenant;
     END;
 END

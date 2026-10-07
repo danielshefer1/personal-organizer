@@ -255,6 +255,29 @@ async def test_bind_connection_is_idempotent_on_the_account(database: Database) 
         assert (again.id, again.status) == (first.id, "active")
 
 
+async def test_a_refused_bind_does_not_revoke_the_active_connection(database: Database) -> None:
+    """The account belongs to tenant B: A's bind raises, and A's own connection survives it
+    even when the caller catches the error and carries on in the same transaction."""
+    tenant_a = await _create(database)
+    tenant_b = await _create(database, key="tel:+972509999999", phone="+972509999999")
+    async with database.tenant_session(TenantId(tenant_b)) as session:
+        await connections.bind_connection(
+            session, tenant_b, connected_account_id="ca_b", auth_config_id="ac_1"
+        )
+    async with database.tenant_session(TenantId(tenant_a)) as session:
+        original = await connections.bind_connection(
+            session, tenant_a, connected_account_id="ca_a", auth_config_id="ac_1"
+        )
+        original_id = original.id  # the savepoint's rollback expires loaded rows
+        with pytest.raises(LookupError):
+            await connections.bind_connection(
+                session, tenant_a, connected_account_id="ca_b", auth_config_id="ac_1"
+            )
+        kept = await session.get(CalendarConnection, original_id, populate_existing=True)
+        assert kept is not None
+        assert kept.status == "active"
+
+
 async def test_concurrent_binds_of_one_account_make_one_row(
     database: Database, owner_conn: Any
 ) -> None:

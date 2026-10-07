@@ -211,7 +211,9 @@ class Database:
         """A session with no tenant GUC.
 
         Only for tables that are not tenant-scoped -- ``procrastinate_*`` and the webhook
-        event log. Using this for a tenant table means RLS returns nothing, loudly.
+        event log -- and for the two ``SECURITY DEFINER`` calls, ``resolve_tenant`` and
+        ``create_tenant``, which run before the tenant is known. Using this for a tenant
+        table means RLS returns nothing, loudly.
         """
         maker = self._maker(role)
         async with maker() as session, session.begin():

@@ -41,31 +41,35 @@ async def bind_connection(
 
     Raises :class:`LookupError` when the account is already bound to *another* tenant. The
     callback's ``user_id`` check (D5) makes that unreachable in practice; if it ever happens,
-    the caller's transaction rolls back and nothing of either tenant changes.
+    the savepoint rolls back the revoke and nothing of either tenant changes, whether or
+    not the caller then rolls back.
     """
     existing = await _by_account(session, tenant_id, connected_account_id)
     if existing is not None:
         return existing
-    await session.execute(
-        scoped(update(CalendarConnection), CalendarConnection, tenant_id)
-        .where(CalendarConnection.status == "active")
-        .values(status="revoked")
-    )
-    await session.execute(
-        insert(CalendarConnection)
-        .values(
-            tenant_id=tenant_id,
-            composio_user_id=str(tenant_id),
-            connected_account_id=connected_account_id,
-            auth_config_id=auth_config_id,
+    # One savepoint around revoke + insert: the LookupError below leaves it, so the revoke is
+    # undone even if the caller catches the error and commits the outer transaction.
+    async with session.begin_nested():
+        await session.execute(
+            scoped(update(CalendarConnection), CalendarConnection, tenant_id)
+            .where(CalendarConnection.status == "active")
+            .values(status="revoked")
         )
-        .on_conflict_do_nothing(index_elements=["connected_account_id"])
-    )
-    bound = await _by_account(session, tenant_id, connected_account_id)
-    if bound is None:
-        # The insert conflicted with a row RLS will not show us: another tenant's.
-        msg = "connected account is bound to another tenant"
-        raise LookupError(msg)
+        await session.execute(
+            insert(CalendarConnection)
+            .values(
+                tenant_id=tenant_id,
+                composio_user_id=str(tenant_id),
+                connected_account_id=connected_account_id,
+                auth_config_id=auth_config_id,
+            )
+            .on_conflict_do_nothing(index_elements=["connected_account_id"])
+        )
+        bound = await _by_account(session, tenant_id, connected_account_id)
+        if bound is None:
+            # The insert conflicted with a row RLS will not show us: another tenant's.
+            msg = "connected account is bound to another tenant"
+            raise LookupError(msg)
     return bound
 
 

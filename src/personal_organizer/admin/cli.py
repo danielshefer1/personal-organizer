@@ -32,6 +32,7 @@ from personal_organizer.db.engine import Database
 from personal_organizer.db.models.tenant import NETWORK_WHATSAPP, Tenant
 from personal_organizer.db.repositories.invites import (
     create_invite,
+    has_open_invite,
     has_used_invite,
     list_invites,
     revoke_invite,
@@ -45,6 +46,10 @@ log = structlog.get_logger(__name__)
 OK: Final = 0
 REFUSED: Final = 1
 
+#: Israel, the circle's country: a national number never starts with 0 after +972, but people
+#: write the trunk 0 anyway (``+972 050-...``). Italy keeps its 0, so this is not a blanket rule.
+_NO_TRUNK_ZERO: Final = ("+9720",)
+
 
 def _out(line: str) -> None:
     sys.stdout.write(line + "\n")
@@ -56,10 +61,19 @@ def wa_link(bot_phone: str) -> str:
 
 
 def parse_phone(raw: str) -> str | None:
-    """The normalised number, or ``None`` after printing why. The input is never echoed."""
+    """The normalised number, or ``None`` after printing why. The input is never echoed.
+
+    A trunk 0 kept after the country code -- ``+44 (0)20 ...``, ``+972 050-...`` -- is refused
+    rather than stored: WhatsApp delivers the number without it, so that invite would never
+    match and the invitee would be told "invite-only".
+    """
     phone = normalise_e164(raw)
     if phone is None:
         _out("not an E.164 number, e.g. +972501234567")
+        return None
+    if "(0)" in raw or phone.startswith(_NO_TRUNK_ZERO):
+        _out("drop the 0 after the country code, e.g. +972501234567")
+        return None
     return phone
 
 
@@ -127,7 +141,10 @@ async def suspend(db: Database, settings: Settings, raw_phone: str) -> int:
         return REFUSED
     tenant = await tenant_of(db, phone)
     if tenant is None:
-        _out("not a member")
+        # With Composio off an invitee is served with no tenant; revoke is what cuts them off.
+        async with db.system_session() as session:
+            pending = await has_open_invite(session, phone)
+        _out("not a member yet (open invite); use revoke" if pending else "not a member")
         return REFUSED
     if tenant.status == "suspended":
         _out("already suspended")

@@ -380,6 +380,13 @@ the language. `po-admin list` shows `used` once their first message is in.
 - `invite already used; use suspend`: revoke is for invites, suspend for members.
 - `on WHATSAPP__ALLOWED_PHONES; remove it there first`: env-listed numbers cannot be
   suspended, so you cannot lock yourself out.
+- `drop the 0 after the country code`: `+972 050-…` or `+44 (0)20 …` would be stored as a
+  number WhatsApp never delivers; type `+972 50-…`.
+- **With `COMPOSIO__ENABLED=false`** an invitee is served (the fixed acknowledgement) but never
+  gets a tenant: `list` keeps showing `open`, and `suspend` answers `not a member yet (open
+  invite); use revoke`. Revoke is the cut-off there. `used`, `suspend` and `unsuspend` need
+  Composio on. Switching Composio off later turns members whose invite is used into
+  strangers until it is back on; numbers on `WHATSAPP__ALLOWED_PHONES` keep being served.
 - `po-admin` prints numbers to your terminal only. Its log lines carry `sender_hash` and
   `tenant_id`, matching `inbound.handled`.
 

@@ -90,6 +90,23 @@ class TestNumbers:
         assert "0501234567" not in out
         assert await _invites(owner_conn) == []
 
+    @pytest.mark.parametrize("typed", ["+972 050-123-4567", "+972 (0)50 123 4567"])
+    async def test_a_trunk_zero_after_the_country_code_is_refused(
+        self,
+        db: Database,
+        admin_settings: Settings,
+        owner_conn: Any,
+        capsys: pytest.CaptureFixture[str],
+        typed: str,
+    ) -> None:
+        """Final review: +9720501234567 is not the number WhatsApp delivers, so the invitee
+        would be told "invite-only" and the invite would stay open for ever."""
+        assert await cli.invite(db, admin_settings, typed, note=None) == 1
+        out = capsys.readouterr().out
+        assert "drop the 0 after the country code" in out
+        assert typed not in out
+        assert await _invites(owner_conn) == []
+
 
 class TestInvite:
     async def test_it_records_the_invite_and_prints_the_link(
@@ -280,6 +297,16 @@ class TestSuspend:
     ) -> None:
         assert await cli.suspend(db, admin_settings, IL_PHONE) == 1
         assert "not a member" in capsys.readouterr().out
+
+    async def test_an_open_invite_points_at_revoke(
+        self, db: Database, admin_settings: Settings, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Final review: with Composio off an invitee is served with no tenant, and revoke is
+        what cuts them off."""
+        await cli.invite(db, admin_settings, IL_PHONE, note=None)
+        capsys.readouterr()
+        assert await cli.suspend(db, admin_settings, IL_PHONE) == 1
+        assert "not a member yet (open invite); use revoke" in capsys.readouterr().out
 
     async def test_suspending_twice_is_fine(
         self, db: Database, admin_settings: Settings, capsys: pytest.CaptureFixture[str]

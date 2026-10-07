@@ -37,7 +37,10 @@ OUTBOX_STATUS_ORDER: Final = (
     "failed",
 )
 
-DISPOSITIONS: Final = ("allowed", "stranger", "stranger_muted", "stale")
+#: What the worker decided about an inbound row. ``onboarding`` (Iteration 03) is a message
+#: from a tenant still onboarding, answered by its current step; ``allowed`` is one from an
+#: active tenant, handed to ``on_allowed``.
+DISPOSITIONS: Final = ("allowed", "stranger", "stranger_muted", "stale", "onboarding")
 
 _GEN_UUID = text("gen_random_uuid()")
 
@@ -85,6 +88,10 @@ class ChannelOutbox(Base):
         UniqueConstraint("inbox_id", "kind"),
         # NULLs are distinct in a unique constraint, so rows not yet accepted do not collide.
         UniqueConstraint("channel", "provider_message_id"),
+        # The claim key for a send that answers no inbound row (D6): "You're all set" is
+        # ``connected:<connection_id>``. NULLs are distinct, so rows claimed on
+        # ``(inbox_id, kind)`` -- every reply -- never collide here.
+        UniqueConstraint("idempotency_key"),
         CheckConstraint(check_in("status", OUTBOX_STATUS_ORDER), name="status"),
         Index(None, "recipient_key", "kind", "created_at"),
     )
@@ -100,6 +107,8 @@ class ChannelOutbox(Base):
     #: ``SenderRef.key`` of the recipient -- what the invite-only rate limit looks up.
     recipient_key: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text, server_default=text("'pending'"))
+    #: Set instead of ``inbox_id`` for a send that answers nothing. See ``messaging.outbox``.
+    idempotency_key: Mapped[str | None] = mapped_column(Text)
     provider_message_id: Mapped[str | None] = mapped_column(Text)
     #: The provider's numeric error code. Never its error message, which can echo content.
     error_code: Mapped[int | None]

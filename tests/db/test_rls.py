@@ -23,6 +23,9 @@ _RLS_TABLES = (
     "WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity"
 )
 
+#: How PostgreSQL prints ``alembic/rls.py``'s predicate back out of ``pg_policies``.
+_CURRENT_TENANT = "(NULLIF(current_setting('app.tenant_id'::text, true), ''::text))::uuid"
+
 
 async def rls_problems(conn: Any, expected: set[str]) -> list[str]:
     """Every way the database's RLS tables differ from ``expected``, as messages."""
@@ -54,6 +57,32 @@ async def test_a_table_with_rls_but_no_force_is_reported(owner_conn: Any) -> Non
     finally:
         await transaction.rollback()
     assert problems == ["rls_probe: RLS but not FORCE; the owner would bypass its own policies"]
+
+
+async def test_the_tenants_table_is_a_tenant_table() -> None:
+    """``tenants`` has no ``tenant_id``; ``TenantRoot`` is what puts it under the invariant."""
+    assert tenant_tables()["tenants"] == "id"
+
+
+async def test_every_tenant_table_has_exactly_the_tenant_isolation_policy(
+    app_conn: Any,
+) -> None:
+    expected = {
+        table: (f"({column} = {_CURRENT_TENANT})",) * 2 for table, column in tenant_tables().items()
+    }
+    rows = await app_conn.fetch(
+        "SELECT tablename, policyname, cmd, permissive, qual, with_check FROM pg_policies "
+        "WHERE schemaname = 'public'"
+    )
+    found = {row["tablename"]: (row["qual"], row["with_check"]) for row in rows}
+    assert found == expected
+    assert len(rows) == len(expected), "a second policy on a tenant table widens what it shows"
+    for row in rows:
+        assert (row["policyname"], row["cmd"], row["permissive"]) == (
+            "tenant_isolation",
+            "ALL",
+            "PERMISSIVE",
+        )
 
 
 async def test_the_queue_never_has_rls(app_conn: Any) -> None:

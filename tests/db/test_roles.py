@@ -97,3 +97,37 @@ async def test_the_definer_owns_no_tables(app_conn: Any) -> None:
         "WHERE r.rolname = 'app_definer'"
     )
     assert owned == 0
+
+
+#: Exactly what app_definer may own. A third function here is a third door past RLS.
+DEFINER_FUNCTIONS = {"resolve_tenant", "create_tenant"}
+
+
+async def test_the_definer_owns_exactly_the_two_resolution_functions(app_conn: Any) -> None:
+    rows = await app_conn.fetch(
+        "SELECT p.proname, p.prosecdef, p.proconfig FROM pg_proc p "
+        "JOIN pg_roles r ON p.proowner = r.oid WHERE r.rolname = 'app_definer'"
+    )
+    assert {row["proname"] for row in rows} == DEFINER_FUNCTIONS
+    for row in rows:
+        assert row["prosecdef"] is True
+        # Without a pinned search_path, a SECURITY DEFINER function resolves names through
+        # whatever schema its caller put first.
+        assert row["proconfig"] == ["search_path=public, pg_temp"]
+
+
+async def test_only_the_runtime_role_may_call_the_definer_functions(app_conn: Any) -> None:
+    """PUBLIC holds EXECUTE on every new function by default. ``acldefault`` stands in for
+    a NULL ACL, which means exactly that default -- reading only ``proacl`` would miss it."""
+    rows = await app_conn.fetch(
+        "SELECT p.proname, coalesce(g.rolname, 'PUBLIC') AS grantee "
+        "FROM pg_proc p "
+        "CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a "
+        "LEFT JOIN pg_roles g ON a.grantee = g.oid "
+        "WHERE p.proname = ANY($1::text[]) AND a.privilege_type = 'EXECUTE'",
+        sorted(DEFINER_FUNCTIONS),
+    )
+    grantees = {(row["proname"], row["grantee"]) for row in rows}
+    assert grantees == {
+        (name, role) for name in DEFINER_FUNCTIONS for role in ("app_definer", "app_user")
+    }

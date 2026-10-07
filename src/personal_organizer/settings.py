@@ -312,6 +312,11 @@ AUTH_CONFIG_PREFIX: Final = "ac_"
 class ComposioSettings(BaseModel):
     """Composio, which holds users' Google tokens so that we never do (v7 Section 3).
 
+    The tokens are issued to *our own* Google OAuth app: published "In production" and
+    unverified, which shows users Google's warning screen and caps the app at 100 users,
+    plugged into a Composio custom auth config. There is no cutover to come;
+    docs/runbook-iteration-03.md sets both up.
+
     Off by default and all-or-nothing when on, like WhatsApp. Enabled, the api serves the
     connect pages and Composio's callback, so it also needs ``APP__PUBLIC_BASE_URL`` and
     ``ONBOARDING__LINK_SECRET`` -- which live in other sections, so ``Settings`` checks all
@@ -320,9 +325,9 @@ class ComposioSettings(BaseModel):
 
     enabled: bool = False
     api_key: SecretStr | None = None
-    #: The auth config *new* connections are made under: Composio's managed Google Calendar
-    #: config until the Section 3.3 cutover, ours after it. Every connection row records the
-    #: config that made it, so changing this never breaks an existing connection.
+    #: The auth config new connections are made under: our custom Google Calendar config,
+    #: one per Composio project. Every connection row records the config that made it, so
+    #: changing this never breaks an existing connection.
     calendar_auth_config_id: str | None = None
     request_timeout_s: float = 15.0
 

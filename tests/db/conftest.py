@@ -19,6 +19,7 @@ from personal_organizer.db.engine import Database
 from personal_organizer.db.roles import DatabaseRole
 from personal_organizer.settings import Settings, WhatsAppSettings
 from tests.fixtures.payloads import APP_SECRET, PHONE_NUMBER_ID
+from tests.fixtures.tenants import with_onboarding
 
 
 def _real_settings() -> Settings:
@@ -135,3 +136,9 @@ def whatsapp_db_settings(db_settings: Settings) -> Settings:
             )
         }
     )
+
+
+@pytest.fixture
+def onboarding_settings(db_settings: Settings) -> Settings:
+    """The real database settings with Composio, and so onboarding, switched on."""
+    return with_onboarding(db_settings)

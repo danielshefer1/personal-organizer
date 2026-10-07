@@ -11,6 +11,11 @@ from typing import Any
 
 import pytest
 
+from personal_organizer.core.errors import MissingDatabaseRoleError
+from personal_organizer.db.bootstrap import check_database, run_bootstrap
+from personal_organizer.db.roles import DatabaseRole
+from personal_organizer.settings import Settings
+
 pytestmark = pytest.mark.db
 
 
@@ -38,3 +43,17 @@ async def test_an_hnsw_index_actually_builds(owner_conn: Any) -> None:
         await owner_conn.execute(
             "CREATE INDEX hnsw_probe_idx ON hnsw_probe USING hnsw (embedding vector_cosine_ops)"
         )
+
+
+async def test_bootstrap_re_runs_cleanly_and_po_db_check_passes(
+    db_settings: Settings, app_conn: Any
+) -> None:
+    """Bootstrap runs on every deploy. A second run must converge -- app_definer included --
+    and leave ``po-db check`` with nothing to report."""
+    del app_conn  # reuses the fixture's skip-if-unavailable behaviour
+    try:
+        db_settings.dsn_for(DatabaseRole.BOOTSTRAP)
+    except MissingDatabaseRoleError:
+        pytest.skip("DATABASE__BOOTSTRAP_URL is not configured")
+    await run_bootstrap(db_settings)
+    assert await check_database(db_settings) == []

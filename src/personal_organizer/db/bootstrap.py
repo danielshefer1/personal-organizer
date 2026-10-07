@@ -18,7 +18,7 @@ import structlog
 from personal_organizer.core.errors import BootstrapError
 from personal_organizer.db.dsn import normalise
 from personal_organizer.db.engine import log_target, retry_until_ready
-from personal_organizer.db.roles import DatabaseRole
+from personal_organizer.db.roles import DEFINER_ROLE_NAME, DatabaseRole
 from personal_organizer.settings import Settings
 
 log = structlog.get_logger(__name__)
@@ -78,13 +78,35 @@ async def run_bootstrap(settings: Settings, *, sql_path: Path | None = None) -> 
                 ("po.owner_password", owner_password),
                 ("po.app_role", app_role),
                 ("po.app_password", app_password),
+                ("po.definer_role", DEFINER_ROLE_NAME),
             ):
                 await conn.execute("SELECT set_config($1, $2, true)", name, value)
             await conn.execute(script)
     finally:
         await conn.close()
 
-    log.info("db.bootstrap.ok", owner_role=owner_role, app_role=app_role)
+    log.info(
+        "db.bootstrap.ok", owner_role=owner_role, app_role=app_role, definer_role=DEFINER_ROLE_NAME
+    )
+
+
+async def _definer_problems(conn: Any) -> list[str]:
+    """``app_definer`` exists, cannot log in, and the runtime role cannot become it."""
+    row = await conn.fetchrow(
+        "SELECT rolcanlogin, rolbypassrls, pg_has_role(current_user, oid, 'MEMBER') AS held "
+        "FROM pg_roles WHERE rolname = $1",
+        DEFINER_ROLE_NAME,
+    )
+    if row is None:
+        return [f"{DEFINER_ROLE_NAME} is missing; run po-db bootstrap"]
+    problems: list[str] = []
+    if row["rolcanlogin"]:
+        problems.append(f"{DEFINER_ROLE_NAME} can log in; it must be NOLOGIN")
+    if not row["rolbypassrls"]:
+        problems.append(f"{DEFINER_ROLE_NAME} lacks BYPASSRLS; resolve_tenant would see nothing")
+    if row["held"]:
+        problems.append(f"runtime role is a member of {DEFINER_ROLE_NAME}, which bypasses RLS")
+    return problems
 
 
 async def check_database(settings: Settings) -> list[str]:
@@ -124,6 +146,8 @@ async def check_database(settings: Settings) -> list[str]:
         )
         if can_create:
             problems.append("runtime role can CREATE in schema public")
+
+        problems += await _definer_problems(conn)
     finally:
         await conn.close()
 

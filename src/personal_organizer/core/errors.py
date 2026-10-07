@@ -23,8 +23,9 @@ class MissingDatabaseRoleError(ConfigError):
 
     code = "missing_database_role"
 
-    def __init__(self, role: str) -> None:
-        super().__init__(f"No DSN configured for database role {role!r}")
+    def __init__(self, role: str, *, reason: str | None = None) -> None:
+        message = f"No DSN configured for database role {role!r}"
+        super().__init__(f"{message}: {reason}" if reason else message)
         self.role = role
 
 

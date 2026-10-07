@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import asyncpg
 import pytest
 
 pytestmark = pytest.mark.db
@@ -68,3 +69,31 @@ async def test_runtime_role_can_use_the_queue(app_conn: Any) -> None:
         )
         is True
     )
+
+
+# --- app_definer (Iteration 03, D1) -------------------------------------------------------
+
+
+async def test_runtime_role_cannot_become_the_definer(app_conn: Any) -> None:
+    """app_definer is BYPASSRLS; app_user holding it would make every policy optional."""
+    assert await app_conn.fetchval("SELECT pg_has_role(current_user, 'app_definer', 'MEMBER')") is (
+        False
+    )
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        await app_conn.execute("SET ROLE app_definer")
+
+
+async def test_the_definer_cannot_log_in(app_conn: Any) -> None:
+    row = await app_conn.fetchrow(
+        "SELECT rolcanlogin, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'app_definer'"
+    )
+    assert row is not None, "app_definer is missing; run po-db bootstrap"
+    assert dict(row) == {"rolcanlogin": False, "rolsuper": False, "rolbypassrls": True}
+
+
+async def test_the_definer_owns_no_tables(app_conn: Any) -> None:
+    owned = await app_conn.fetchval(
+        "SELECT count(*) FROM pg_class c JOIN pg_roles r ON c.relowner = r.oid "
+        "WHERE r.rolname = 'app_definer'"
+    )
+    assert owned == 0

@@ -17,7 +17,7 @@ import asyncpg
 import pytest
 
 from personal_organizer.db import bootstrap
-from personal_organizer.db.roles import DatabaseRole
+from personal_organizer.db.roles import DEFINER_ROLE_NAME, DatabaseRole
 from personal_organizer.settings import Settings
 
 
@@ -95,3 +95,52 @@ async def test_one_attempt_cannot_spend_the_whole_budget(
 
     assert connect.calls[0]["timeout"] == bootstrap.ATTEMPT_TIMEOUT_S
     assert connect.calls[0]["dsn"].startswith("postgresql://postgres:")
+
+
+class _Transaction:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _RecordingConnection:
+    def __init__(self) -> None:
+        self.gucs: dict[str, str] = {}
+        self.scripts: list[str] = []
+
+    def transaction(self) -> _Transaction:
+        return _Transaction()
+
+    async def execute(self, sql: str, *args: str) -> None:
+        if args:
+            self.gucs[args[0]] = args[1]
+        else:
+            self.scripts.append(sql)
+
+    async def close(self) -> None:
+        return None
+
+
+async def test_bootstrap_names_the_definer_role(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``bootstrap.sql`` reads every role name from a GUC; a missing one aborts the script."""
+    conn = _RecordingConnection()
+
+    async def connect(_settings: Settings, _role: DatabaseRole) -> _RecordingConnection:
+        return conn
+
+    monkeypatch.setattr(bootstrap, "_connect", connect)
+    await bootstrap.run_bootstrap(settings)
+
+    assert conn.gucs["po.definer_role"] == DEFINER_ROLE_NAME == "app_definer"
+    assert set(conn.gucs) == {
+        "po.owner_role",
+        "po.owner_password",
+        "po.app_role",
+        "po.app_password",
+        "po.definer_role",
+    }
+    assert conn.scripts == [bootstrap.BOOTSTRAP_SQL.read_text()]

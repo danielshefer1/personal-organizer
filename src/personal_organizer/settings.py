@@ -392,7 +392,16 @@ class Settings(BaseSettings):
         return self.app.env in ("staging", "production")
 
     def dsn_for(self, role: DatabaseRole) -> str:
-        """Return the DSN for ``role``, or raise if it was never configured."""
+        """Return the DSN for ``role``, or raise if it was never configured.
+
+        ``DEFINER`` is refused outright rather than looked up: ``app_definer`` is ``NOLOGIN``,
+        so no DSN for it can work, and a ``DATABASE__DEFINER_URL`` someone adds would be a
+        BYPASSRLS login waiting to be enabled.
+        """
+        if role is DatabaseRole.DEFINER:
+            raise MissingDatabaseRoleError(
+                role.value, reason="app_definer is NOLOGIN; it owns functions, nothing connects"
+            )
         value: SecretStr | None = getattr(self.database, f"{role.value}_url", None)
         if value is None:
             raise MissingDatabaseRoleError(role.value)

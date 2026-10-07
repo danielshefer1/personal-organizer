@@ -132,6 +132,7 @@ mounts `/connect/*` is deployed to staging.
 | `APP__PUBLIC_BASE_URL` | api, worker | `https://<staging api domain>`: an origin, no path, no trailing route | boot fails with `must be an origin`, or `must be https:// when deployed`. A domain that is not the api's: links in WhatsApp lead nowhere. The wrong origin at Composio: the callback never reaches the api |
 | `ONBOARDING__LINK_SECRET` | api, worker | at least 32 characters: `uv run python -c "import secrets; print(secrets.token_hex(32))"` | boot fails when missing, shorter than 32, or `.env.example`'s placeholder when deployed. **Different on api and worker**: every link, even a fresh one tapped at once, shows "This link has expired" (410, api logs `connect.page_refused`) and nothing else fails |
 | `ONBOARDING__LINK_TTL_S` | api, worker | leave unset (`900`); 60–3600 | outside the range: boot fails. Shorter than a user takes to switch apps and sign in: links expire on the tap |
+| `ONBOARDING__BOT_PHONE` | worker | the number invitees write to, E.164 — today the GOWA SIM | not E.164: boot fails. Unset: `po-admin invite` records the invite but prints no link |
 
 - **`ONBOARDING__LINK_SECRET` must be identical on both services.** The worker signs and the
   api verifies. Use one Railway shared variable, or paste the same value twice. Rotating it
@@ -149,7 +150,7 @@ table):
 
 | Variable | Services | If wrong |
 |---|---|---|
-| `WHATSAPP__ALLOWED_PHONES` | api, worker | the invite list, for every channel: a number not on it in the form it arrives is told "invite-only". Compare `po-gowa hash +<number>` with `sender_hash` on `inbound.handled`; the hash matches only with staging's `LOGGING__PII_PEPPER`, e.g. `railway run --service worker --environment staging uv run po-gowa hash +<number>` |
+| `WHATSAPP__ALLOWED_PHONES` | api, worker | the **fallback** invite list, for every channel — your own number at least; invite everyone else with `po-admin` (section "Inviting people"). A number not on it in the form it arrives is told "invite-only". Compare `po-gowa hash +<number>` with `sender_hash` on `inbound.handled`; the hash matches only with staging's `LOGGING__PII_PEPPER`, e.g. `railway run --service worker --environment staging uv run po-gowa hash +<number>` |
 | `GOWA__ENABLED`, `GOWA__BASIC_AUTH_USER`, `GOWA__BASIC_AUTH_PASSWORD`, `GOWA__WEBHOOK_SECRET` | api, worker: all of them, same values | boot fails on any service where one is missing; a mismatch with the gateway is `gowa.unhealthy` with status 401, or `gowa.signature_rejected` |
 | `GOWA__BASE_URL` | api, worker: same value (a deployed api fails boot on the default `http://localhost:3000`) | a malformed URL (an embedded space or a non-numeric port): `gowa.unhealthy`, `reason: bad_response`, `error_type: InvalidURL`. Plain `http://` to a host that is not `*.railway.internal` fails boot when deployed |
 | `GOWA__DEVICE_ID` | api, worker | leave unset with one device. A non-Latin-1 character: `gowa.unhealthy`, `reason: bad_response`, `error_type: UnicodeEncodeError` |
@@ -357,6 +358,33 @@ An auth error, or an account that is no longer ACTIVE, means the refresh token d
 the app was still in Testing when the user connected, or the user revoked access in their
 Google account. Publish the app (2.4), then reconnect them (section 5). Record the result in
 the ops checklist below.
+
+## Inviting people
+
+Invites live in the database (ADR 0006); no deploy is involved. Run `po-admin` inside the
+worker, where the private database host resolves:
+
+```sh
+railway ssh --service worker --environment staging
+po-admin invite +972501234567 --note "Mom"   # prints https://wa.me/<bot number>
+po-admin list                                # newest first: open / used / revoked, member status
+po-admin revoke +972501234567                # an invite nobody has used yet
+po-admin suspend +972501234567               # a member: their messages get the invite-only line
+po-admin unsuspend +972501234567             # back to active, or onboarding if they never finished
+```
+
+Forward the link yourself. The invitee taps it and writes anything; their first words pick
+the language. `po-admin list` shows `used` once their first message is in.
+
+- `already a member (…)`: they have a tenant; an invite would never be read.
+- `invite already used; use suspend`: revoke is for invites, suspend for members.
+- `on WHATSAPP__ALLOWED_PHONES; remove it there first`: env-listed numbers cannot be
+  suspended, so you cannot lock yourself out.
+- `po-admin` prints numbers to your terminal only. Its log lines carry `sender_hash` and
+  `tenant_id`, matching `inbound.handled`.
+
+If `railway ssh` is unavailable, `railway run --service worker --environment staging uv run
+po-admin list` works only from a machine that can reach the database host.
 
 ## When it does not work
 

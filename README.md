@@ -3,10 +3,11 @@
 A WhatsApp AI personal organizer: calendar, reminders and long-term memory, reachable over
 WhatsApp. This repository is the implementation of the v7 plan. **Iteration 01 (walking
 skeleton)**, **Iteration 02 (WhatsApp webhook, queue and access controls)** and **Iteration
-03 (tenants under RLS, onboarding and the Google Calendar connect)** exist. An invited sender
-is onboarded, in Hebrew or English: they confirm a time zone with a numbered reply, then tap
-one link to connect Google Calendar. After that they get a fixed acknowledgement. Everyone
-else gets a one-line "invite-only" reply. There is no agent yet.
+03 (tenants under RLS, onboarding and the Google Calendar connect)** exist. A sender invited
+with `po-admin invite` (or on `WHATSAPP__ALLOWED_PHONES`) is onboarded, in Hebrew or English:
+they confirm a time zone with a numbered reply, then tap one link to connect Google Calendar.
+After that they get a fixed acknowledgement. Everyone else gets a one-line "invite-only"
+reply. There is no agent yet.
 
 WhatsApp arrives through either of two channels, separately switched and able to run side
 by side: Meta's Cloud API (`whatsapp`), and the GOWA QR-code gateway (`gowa`), which links a
@@ -21,6 +22,7 @@ dedicated SIM as a WhatsApp Web device while Meta's business verification is pen
 | `src/personal_organizer/worker/` | Procrastinate worker and task registry, including `system:gowa_health`, the gateway health alarm (a failed check logs `gowa.unhealthy` and reports it to Sentry as one issue). |
 | `src/personal_organizer/db/` | Async engines per role, tenant-scoped sessions, bootstrap, `po-db`, ORM models, and `repositories/`: tenant-scoped queries, each also filtered through `scoped()`. |
 | `src/personal_organizer/messaging/` | Provider-neutral ingress (persist-then-ack), the invite and onboarding gate, numbered choices, at-most-once replies. |
+| `src/personal_organizer/admin/` | `po-admin`: invite, revoke, suspend, unsuspend and list the circle (docs/adr/0006). |
 | `src/personal_organizer/onboarding/` | Signed, single-use connect links and the /connect page texts. |
 | `src/personal_organizer/providers/calendar/` | Composio: the connect link and the connected-account check. |
 | `src/personal_organizer/providers/channel/whatsapp/` | Meta Cloud API: payload parser, Graph sends, `po-whatsapp`. |
@@ -86,6 +88,11 @@ with self-made credentials, then
 
 ```sh
 uv run po-gowa simulate --url http://localhost:8000/webhooks/gowa --from +31612345678 --replay 10
+```
+
+```sh
+uv run po-admin invite +31612345678 --note "me"   # then simulate a message from that number
+uv run po-admin list
 ```
 
 To link a real phone, `docker compose --profile gateway up -d gowa` runs the gateway

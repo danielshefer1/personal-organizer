@@ -203,8 +203,8 @@ Four PRs, `iteration-03/<n>-<name>`, each green on its own.
   all in the calendar-read iteration.
 - `pending_actions`, `scheduled_jobs` (D8). Token and message budgets, `usage_daily`.
 - Native buttons and polls (`send_choice`): chosen by the day-1 checks.
-- Tenant deletion and data export, and DB-backed invites. Before the circle grows past a
-  handful of people.
+- Tenant deletion and data export, before the circle grows past a handful of people.
+  (DB-backed invites: done, docs/adr/0006.)
 - **Dropped for good** (2026-10-07 review): the age gate and ToS flow, backup email, Google
   verification and the cutover campaign, templates.
 

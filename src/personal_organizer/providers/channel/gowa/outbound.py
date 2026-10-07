@@ -22,6 +22,7 @@ messages can quote the recipient back.
 from __future__ import annotations
 
 import asyncio
+import random
 from collections.abc import Awaitable, Callable
 from typing import Any, Final
 
@@ -57,6 +58,7 @@ _NO_CLIENT_CODES: Final = frozenset({"INVALID_WA_CLI"})
 _NOT_SENT: Final = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 Sleep = Callable[[float], Awaitable[None]]
+Uniform = Callable[[float, float], float]
 
 
 def _error_code(response: httpx.Response) -> str | None:
@@ -76,16 +78,25 @@ class GowaOutbound:
         *,
         device_id: str | None = None,
         typing_delay_s: float = 0.0,
+        typing_jitter_s: float = 0.0,
         sleep: Sleep = asyncio.sleep,
+        uniform: Uniform = random.uniform,
     ) -> None:
         self._http = http
         self._headers = {DEVICE_HEADER: device_id} if device_id else {}
         self._typing_delay_s = typing_delay_s
+        self._typing_jitter_s = typing_jitter_s
         self._sleep = sleep
+        self._uniform = uniform
 
     @classmethod
     def from_settings(cls, settings: GowaSettings, http: httpx.AsyncClient) -> GowaOutbound:
-        return cls(http, device_id=settings.device_id, typing_delay_s=settings.typing_delay_s)
+        return cls(
+            http,
+            device_id=settings.device_id,
+            typing_delay_s=settings.typing_delay_s,
+            typing_jitter_s=settings.typing_jitter_s,
+        )
 
     def __repr__(self) -> str:
         return f"GowaOutbound(device_id={self._headers.get(DEVICE_HEADER)!r})"
@@ -111,8 +122,9 @@ class GowaOutbound:
         does not carry, and blue ticks are cosmetic."""
 
     async def _typing(self, jid: str) -> None:
-        """Best effort: a typing indicator, then a pause. Never fails the send."""
-        if self._typing_delay_s <= 0:
+        """Best effort: a typing indicator, then a pause of varying length. Never fails the
+        send."""
+        if self._typing_delay_s <= 0 and self._typing_jitter_s <= 0:
             return
         try:
             response = await self._http.post(
@@ -123,7 +135,7 @@ class GowaOutbound:
         else:
             if not response.is_success:
                 log.info("gowa.presence_failed", status_code=response.status_code)
-        await self._sleep(self._typing_delay_s)
+        await self._sleep(self._typing_delay_s + self._uniform(0.0, self._typing_jitter_s))
 
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:

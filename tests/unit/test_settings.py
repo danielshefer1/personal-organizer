@@ -302,6 +302,19 @@ class TestGowa:
     def test_the_typing_delay_is_bounded(self, settings_factory: Any) -> None:
         with pytest.raises(ValidationError):
             settings_factory(GOWA__TYPING_DELAY_S="30")
+        with pytest.raises(ValidationError):
+            settings_factory(GOWA__TYPING_DELAY_S="10.5")
+        assert settings_factory(GOWA__TYPING_DELAY_S="10").gowa.typing_delay_s == 10.0
+
+    def test_the_typing_jitter_is_bounded(self, settings_factory: Any) -> None:
+        with pytest.raises(ValidationError):
+            settings_factory(GOWA__TYPING_JITTER_S="6")
+        with pytest.raises(ValidationError):
+            settings_factory(GOWA__TYPING_JITTER_S="-1")
+
+    def test_replies_pause_three_to_five_seconds_by_default(self, settings_factory: Any) -> None:
+        gowa = settings_factory().gowa
+        assert (gowa.typing_delay_s, gowa.typing_jitter_s) == (3.0, 2.0)
 
     def test_credentials_never_render(self, settings_factory: Any) -> None:
         cfg = settings_factory(GOWA__ENABLED="true", **_GOWA_CREDENTIALS)

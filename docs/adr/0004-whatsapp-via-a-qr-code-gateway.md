@@ -53,8 +53,8 @@ run at once.**
 
 - **This breaches WhatsApp's terms of service.** Automated use of a consumer account can get
   the number banned without notice and without appeal. Mitigations: a dedicated SIM; a
-  typing indicator and a pause before every reply (`GOWA__TYPING_DELAY_S`); reply-only
-  traffic. Proactive messages (reminders, when they come) must be paced and must only go to
+  typing indicator and a pause of random length before every reply (`GOWA__TYPING_DELAY_S`
+  plus up to `GOWA__TYPING_JITTER_S`); reply-only traffic. Proactive messages (reminders, when they come) must be paced and must only go to
   people who have written first, or the reach-out timelock will refuse them.
 - **The gateway holds a live login to the account, and its chat history.** Its volume
   (`/app/storages`) is as sensitive as a password plus the messages themselves. It is

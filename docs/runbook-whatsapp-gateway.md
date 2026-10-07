@@ -27,7 +27,8 @@ On our **api and worker** (set the same set on both):
 | `GOWA__BASIC_AUTH_PASSWORD` | its password: `uv run python -c "import secrets; print(secrets.token_urlsafe(32))"` |
 | `GOWA__WEBHOOK_SECRET` | the gateway's `WHATSAPP_WEBHOOK_SECRET`: `uv run python -c "import secrets; print(secrets.token_hex(32))"` |
 | `GOWA__DEVICE_ID` | leave unset (one device) |
-| `GOWA__TYPING_DELAY_S` | default `1.5`; between `0` and `5` |
+| `GOWA__TYPING_DELAY_S` | default `3`; between `0` and `10` |
+| `GOWA__TYPING_JITTER_S` | default `2`; between `0` and `5` — a random extra on each pause |
 | `WHATSAPP__ALLOWED_PHONES` | the invite list, for every channel |
 
 With `ENABLED=true` a service refuses to boot without the auth pair and the secret, and

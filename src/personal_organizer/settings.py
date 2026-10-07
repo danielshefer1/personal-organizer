@@ -262,9 +262,11 @@ class GowaSettings(BaseModel):
     #: when the gateway holds more than one device; with one, it is the default.
     device_id: str | None = None
     send_timeout_s: float = 10.0
-    #: A typing indicator this long precedes every reply. A linked device that answers in
-    #: milliseconds, every time, looks like what it is; a ban costs the number.
-    typing_delay_s: float = Field(default=1.5, ge=0.0, le=5.0)
+    #: A typing indicator at least this long precedes every reply. A linked device that
+    #: answers in milliseconds, every time, looks like what it is; a ban costs the number.
+    typing_delay_s: float = Field(default=3.0, ge=0.0, le=10.0)
+    #: A random extra of up to this long on each pause: a fixed one is a fingerprint too.
+    typing_jitter_s: float = Field(default=2.0, ge=0.0, le=5.0)
 
     @field_validator("base_url")
     @classmethod

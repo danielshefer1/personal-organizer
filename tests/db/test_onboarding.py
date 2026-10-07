@@ -1,0 +1,487 @@
+"""Onboarding over chat, end to end against Postgres, with fake channels.
+
+Done-When (the chat half): an invited number writes, confirms its time zone with a numbered
+reply and is sent a connect link. Also pinned:
+- D2: who is served, onboarded, enrolled or turned away;
+- D7: a known tenant's words end up under RLS and nowhere else;
+- that no re-run of any job sends twice or advances twice.
+"""
+
+from __future__ import annotations
+
+import io
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from uuid import UUID
+
+import pytest
+
+from personal_organizer.core.errors import TransientChannelError
+from personal_organizer.core.types import TenantId
+from personal_organizer.db.engine import Database
+from personal_organizer.db.models.tenant import NETWORK_WHATSAPP
+from personal_organizer.db.repositories.links import consume_link
+from personal_organizer.db.repositories.messages import record_inbound
+from personal_organizer.db.repositories.tenants import resolve_tenant
+from personal_organizer.interfaces.channel import OutboundChannel, OutboundMessage
+from personal_organizer.messaging import inbound
+from personal_organizer.messaging.inbound import InboxRow, acknowledge, handle_inbound
+from personal_organizer.messaging.onboarding import welcome_text
+from personal_organizer.messaging.onboarding_text import t
+from personal_organizer.messaging.replies import ACK_TEXT, INVITE_ONLY_TEXT
+from personal_organizer.observability.logging import configure_logging
+from personal_organizer.settings import Settings
+from tests.fixtures.channels import FakeOutbound, Spy, insert_inbox
+from tests.fixtures.tenants import (
+    BASE_URL,
+    IL_PHONE,
+    NL_PHONE,
+    US_PHONE,
+    link_payload,
+    links_of,
+    messages_of,
+    new_tenant,
+    tenant_by_phone,
+)
+
+pytestmark = [
+    pytest.mark.db,
+    pytest.mark.usefixtures("clean_channel_tables", "clean_tenant_tables"),
+]
+
+STRANGER_PHONE = "+447700900123"
+UNINVITED_TENANT_PHONE = "+4915112345678"
+INVITED = frozenset({IL_PHONE, NL_PHONE, US_PHONE})
+
+
+@pytest.fixture
+async def db(onboarding_settings: Settings, owner_conn: Any) -> AsyncIterator[Database]:
+    database = Database(onboarding_settings)
+    try:
+        yield database
+    finally:
+        await database.dispose()
+
+
+@dataclass
+class Person:
+    """One person writing to the bot: each ``say`` stores a message as ingress would and runs
+    its job as the worker would. Both channels are live, and replies follow the inbound one."""
+
+    db: Database
+    conn: Any
+    settings: Settings
+    phone: str | None = NL_PHONE
+    user_id: str | None = None
+    gowa: FakeOutbound = field(default_factory=lambda: FakeOutbound(name="gowa"))
+    meta: FakeOutbound = field(default_factory=lambda: FakeOutbound(name="whatsapp"))
+    agent: Spy = field(default_factory=Spy)
+    last: UUID | None = None
+
+    async def say(
+        self,
+        body: str | None,
+        *,
+        via: str = "gowa",
+        reply_id: str | None = None,
+        message_type: str = "text",
+        sent_at: datetime | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> str | None:
+        self.last = await insert_inbox(
+            self.conn,
+            phone=self.phone,
+            user_id=self.user_id,
+            body=body,
+            reply_id=reply_id,
+            message_type=message_type,
+            channel=via,
+            sent_at=sent_at,
+        )
+        return await self.run(self.last, now=now)
+
+    async def run(self, inbox_id: UUID, *, now: Callable[[], datetime] | None = None) -> str | None:
+        return await handle_inbound(
+            inbox_id,
+            db=self.db,
+            channels={self.gowa.name: self.gowa, self.meta.name: self.meta}.__getitem__,
+            allowlist=INVITED,
+            on_allowed=self.agent,
+            settings=self.settings,
+            now=now or (lambda: datetime.now(UTC)),
+        )
+
+    def texts(self) -> list[str]:
+        return [message.body for message in self.gowa.sent + self.meta.sent]
+
+
+@pytest.fixture
+def person(db: Database, owner_conn: Any, onboarding_settings: Settings) -> Person:
+    return Person(db, owner_conn, onboarding_settings)
+
+
+async def _inbox(conn: Any, inbox_id: UUID | None) -> Any:
+    return await conn.fetchrow("SELECT * FROM channel_inbox WHERE id = $1", inbox_id)
+
+
+async def _kinds(conn: Any) -> list[str]:
+    rows = await conn.fetch("SELECT kind FROM channel_outbox ORDER BY created_at")
+    return [row["kind"] for row in rows]
+
+
+def _fail_finishing_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The database goes away inside the transaction that finishes the row."""
+    real = record_inbound
+    calls: list[int] = []
+
+    async def flaky(*args: Any, **kwargs: Any) -> UUID:
+        calls.append(1)
+        if len(calls) == 1:
+            msg = "the database went away at the commit"
+            raise ConnectionResetError(msg)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(inbound, "record_inbound", flaky)
+
+
+class TestFirstMessage:
+    async def test_an_invited_number_becomes_an_onboarding_tenant(
+        self, db: Database, owner_conn: Any, onboarding_settings: Settings
+    ) -> None:
+        person = Person(db, owner_conn, onboarding_settings, phone=IL_PHONE)
+        assert await person.say("שלום!") == "onboarding"
+
+        tenant = await tenant_by_phone(db, IL_PHONE)
+        assert tenant is not None
+        assert (tenant.status, tenant.onboarding_step, tenant.language, tenant.timezone) == (
+            "onboarding",
+            "zone",
+            "he",
+            None,
+        )
+        assert person.texts() == [welcome_text("he", "Asia/Jerusalem")]
+        assert person.gowa.read != []
+        assert person.agent.calls == []
+        assert await _kinds(owner_conn) == ["onboarding:welcome_zone"]
+
+    @pytest.mark.parametrize(
+        ("body", "language"), [("hello", "en"), (None, "en"), ("hi שלום", "he")]
+    )
+    async def test_the_language_comes_from_the_words_not_the_number(
+        self,
+        db: Database,
+        owner_conn: Any,
+        onboarding_settings: Settings,
+        body: str | None,
+        language: str,
+    ) -> None:
+        person = Person(db, owner_conn, onboarding_settings, phone=IL_PHONE)
+        await person.say(body, message_type="text" if body else "sticker")
+        tenant = await tenant_by_phone(db, IL_PHONE)
+        assert tenant is not None
+        assert tenant.language == language
+
+    async def test_its_content_moves_under_rls(self, person: Person, db: Database) -> None:
+        await person.say("Oncology appointment with Dr Meyer")
+        row = await _inbox(person.conn, person.last)
+        assert (row["body"], row["raw"], row["disposition"]) == (None, None, "onboarding")
+        assert row["processed_at"] is not None
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        [message] = await messages_of(db, tenant.id)
+        assert (message.direction, message.channel, message.inbox_id, message.body) == (
+            "in",
+            "gowa",
+            person.last,
+            "Oncology appointment with Dr Meyer",
+        )
+
+    async def test_a_tenant_left_by_a_crashed_job_still_gets_the_welcome(
+        self, person: Person, db: Database
+    ) -> None:
+        """The previous run created the tenant and died: the re-run must welcome, not retry."""
+        await new_tenant(db)
+        await person.say("hi")
+        assert person.texts() == [welcome_text("en", "Europe/Amsterdam")]
+
+    async def test_a_stale_first_message_creates_no_tenant(
+        self, person: Person, db: Database
+    ) -> None:
+        sent_at = datetime.now(UTC) - timedelta(hours=30)
+        assert await person.say("hi", sent_at=sent_at) == "stale"
+        assert await tenant_by_phone(db, NL_PHONE) is None
+        assert person.gowa.attempts == []
+        assert (await _inbox(person.conn, person.last))["body"] is None
+
+
+class TestComposioOff:
+    async def test_iteration_02_exactly(
+        self, db: Database, owner_conn: Any, db_settings: Settings
+    ) -> None:
+        """Before Composio is configured, invited senders keep the acknowledgement."""
+        channel = FakeOutbound(name="gowa")
+        inbox_id = await insert_inbox(owner_conn)
+
+        async def ack(row: InboxRow, resolved: OutboundChannel) -> None:
+            await acknowledge(row, resolved, db=db)
+
+        disposition = await handle_inbound(
+            inbox_id,
+            db=db,
+            channels={"gowa": channel}.__getitem__,
+            allowlist=INVITED,
+            on_allowed=ack,
+            settings=db_settings,
+        )
+        assert disposition == "allowed"
+        assert channel.sent == [OutboundMessage(recipient=NL_PHONE, body=ACK_TEXT)]
+        assert await tenant_by_phone(db, NL_PHONE) is None
+        assert (await _inbox(owner_conn, inbox_id))["body"] == "hi"
+
+
+class TestStrangers:
+    async def test_unchanged_with_composio_on(
+        self, db: Database, owner_conn: Any, onboarding_settings: Settings
+    ) -> None:
+        stranger = Person(db, owner_conn, onboarding_settings, phone=STRANGER_PHONE)
+        assert await stranger.say("hello") == "stranger"
+        assert stranger.texts() == [INVITE_ONLY_TEXT]
+        assert stranger.agent.calls == []
+        assert await tenant_by_phone(db, STRANGER_PHONE) is None
+        assert (await _inbox(owner_conn, stranger.last))["body"] is None
+
+    async def test_a_suspended_tenant_is_turned_away(self, person: Person, db: Database) -> None:
+        await new_tenant(db, status="suspended")
+        assert await person.say("hello") == "stranger"
+        assert person.texts() == [INVITE_ONLY_TEXT]
+        assert person.agent.calls == []
+        assert (await _inbox(person.conn, person.last))["body"] is None
+
+
+class TestZoneToConnect:
+    async def test_the_whole_chat(self, person: Person, db: Database) -> None:
+        await person.say("hi")
+        assert await person.say("1") == "onboarding"
+
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        assert (tenant.timezone, tenant.onboarding_step) == ("Europe/Amsterdam", "connect")
+        first_link = link_payload(person.texts()[-1])
+        assert first_link.tenant_id == tenant.id
+
+        await person.say("did it work?")
+        resent = person.texts()[-1]
+        assert resent == t("connect_link", "en", url=resent.rsplit("\n", 1)[-1])
+        assert link_payload(resent).nonce == first_link.nonce
+        assert len(await links_of(db, tenant.id)) == 1
+        assert await _kinds(person.conn) == [
+            "onboarding:welcome_zone",
+            "onboarding:connect",
+            "onboarding:connect_resend",
+        ]
+        assert len(await messages_of(db, tenant.id)) == 3
+
+    async def test_change_then_a_city(self, person: Person, db: Database) -> None:
+        await person.say("hi")
+        await person.say("2")
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        assert (tenant.timezone, tenant.onboarding_step) == (None, "zone")
+
+        await person.say("London")
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        assert (tenant.timezone, tenant.onboarding_step) == ("Europe/London", "connect")
+
+    async def test_a_used_or_aging_link_is_replaced(self, person: Person, db: Database) -> None:
+        await person.say("hi")
+        await person.say("1")
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        first = link_payload(person.texts()[-1]).nonce
+        async with db.tenant_session(TenantId(tenant.id)) as session:
+            await consume_link(session, tenant.id, nonce=first, now=datetime.now(UTC))
+
+        await person.say("the link didn't work")
+        second = link_payload(person.texts()[-1]).nonce
+        assert second != first
+
+        ttl = person.settings.onboarding.link_ttl_s
+        later = datetime.now(UTC) + timedelta(seconds=ttl * 0.6)
+        await person.say("still nothing", now=lambda: later)
+        assert link_payload(person.texts()[-1]).nonce not in (first, second)
+
+
+class TestReRuns:
+    async def test_a_transient_failure_neither_advances_nor_double_sends(
+        self, person: Person, db: Database
+    ) -> None:
+        await person.say("hi")
+        person.gowa.failures.append(TransientChannelError("429"))
+        with pytest.raises(TransientChannelError):
+            await person.say("1")
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        assert tenant.onboarding_step == "zone"
+        assert person.last is not None
+
+        assert await person.run(person.last) == "onboarding"
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        assert tenant.onboarding_step == "connect"
+        assert len(person.gowa.sent) == 2  # the welcome, then one link
+        assert len(await links_of(db, tenant.id)) == 1
+
+    async def test_a_crash_after_the_send_neither_resends_nor_advances_twice(
+        self, person: Person, db: Database, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review Focus 1: the link went out, then the job died before committing the step."""
+        await person.say("hi")
+        _fail_finishing_once(monkeypatch)
+        with pytest.raises(ConnectionResetError):
+            await person.say("1")
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        assert (tenant.onboarding_step, tenant.timezone) == ("zone", None)
+        assert (await _inbox(person.conn, person.last))["processed_at"] is None
+        assert person.last is not None
+
+        assert await person.run(person.last) == "onboarding"
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        assert (tenant.onboarding_step, tenant.timezone) == ("connect", "Europe/Amsterdam")
+        assert len(person.gowa.sent) == 2
+        assert await _kinds(person.conn) == ["onboarding:welcome_zone", "onboarding:connect"]
+        assert len(await messages_of(db, tenant.id)) == 2
+
+    async def test_a_crash_on_the_first_message_still_welcomes_once(
+        self, person: Person, db: Database, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Crash after the welcome went out: the re-run is still a *first* message, because
+        nothing was recorded, and so makes the same decision. One tenant, one welcome."""
+        _fail_finishing_once(monkeypatch)
+        with pytest.raises(ConnectionResetError):
+            await person.say("hi")
+        assert person.last is not None
+        assert len(person.gowa.sent) == 1
+        assert (await _inbox(person.conn, person.last))["processed_at"] is None
+        assert (await _inbox(person.conn, person.last))["body"] == "hi"
+
+        assert await person.run(person.last) == "onboarding"
+        assert len(person.gowa.sent) == 1
+        assert await _kinds(person.conn) == ["onboarding:welcome_zone"]
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        assert tenant.onboarding_step == "zone"
+        assert len(await messages_of(db, tenant.id)) == 1
+
+    async def test_the_same_job_twice_advances_and_records_once(
+        self, person: Person, db: Database
+    ) -> None:
+        await person.say("hi")
+        await person.say("1")
+        assert person.last is not None
+        assert await person.run(person.last) == "onboarding"
+        assert await person.run(person.last) == "onboarding"
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        assert (tenant.onboarding_step, tenant.timezone) == ("connect", "Europe/Amsterdam")
+        assert len(person.gowa.sent) == 2
+        assert await _kinds(person.conn) == ["onboarding:welcome_zone", "onboarding:connect"]
+        assert len(await messages_of(db, tenant.id)) == 2
+
+    async def test_a_finished_row_is_a_no_op(self, person: Person) -> None:
+        await person.say("hi")
+        assert person.last is not None
+        assert await person.run(person.last) == "onboarding"
+        assert len(person.gowa.sent) == 1
+
+
+class TestActiveTenants:
+    async def test_handed_to_the_agent_and_kept_under_rls(
+        self, person: Person, db: Database
+    ) -> None:
+        tenant_id = await new_tenant(db, status="active")
+        assert await person.say("Oncology appointment with Dr Meyer") == "allowed"
+        assert [row.id for row in person.agent.calls] == [person.last]
+        assert person.agent.calls[0].body == "Oncology appointment with Dr Meyer"
+        assert person.gowa.read != []
+        assert person.texts() == []  # the Spy stands in for the acknowledgement
+        assert (await _inbox(person.conn, person.last))["body"] is None
+        [message] = await messages_of(db, tenant_id)
+        assert message.body == "Oncology appointment with Dr Meyer"
+
+    async def test_identity_wins_over_the_invite_list(
+        self, db: Database, owner_conn: Any, onboarding_settings: Settings
+    ) -> None:
+        """Onboarded people stay served after their number leaves WHATSAPP__ALLOWED_PHONES."""
+        await new_tenant(db, phone=UNINVITED_TENANT_PHONE, status="active")
+        person = Person(db, owner_conn, onboarding_settings, phone=UNINVITED_TENANT_PHONE)
+        assert await person.say("hello") == "allowed"
+        assert len(person.agent.calls) == 1
+
+    async def test_a_stale_message_is_kept_but_not_answered(
+        self, person: Person, db: Database
+    ) -> None:
+        tenant_id = await new_tenant(db, status="active")
+        sent_at = datetime.now(UTC) - timedelta(hours=30)
+        assert await person.say("from yesterday", sent_at=sent_at) == "stale"
+        assert person.agent.calls == []
+        assert person.gowa.attempts == []
+        assert (await _inbox(person.conn, person.last))["body"] is None
+        assert [m.body for m in await messages_of(db, tenant_id)] == ["from yesterday"]
+
+
+class TestOnePersonTwoChannels:
+    async def test_enrolled_on_the_gateway_continued_on_meta(
+        self, person: Person, db: Database
+    ) -> None:
+        await person.say("hi", via="gowa")
+        await person.say("1", via="whatsapp")
+        assert len(person.gowa.sent) == 1
+        assert len(person.meta.sent) == 1  # the reply follows the inbound channel
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        assert tenant.onboarding_step == "connect"
+
+    async def test_a_bsuid_then_a_hidden_number_stay_one_tenant(
+        self, db: Database, owner_conn: Any, onboarding_settings: Settings
+    ) -> None:
+        """Review Focus 3, through the gate."""
+        meta = Person(db, owner_conn, onboarding_settings, user_id="US.1")
+        await meta.say("hi", via="whatsapp")
+        hidden = Person(
+            db, owner_conn, onboarding_settings, phone=None, user_id="US.1", meta=meta.meta
+        )
+        assert await hidden.say("1", via="whatsapp") == "onboarding"
+        gateway = Person(db, owner_conn, onboarding_settings, gowa=meta.gowa, meta=meta.meta)
+        assert await gateway.say("hello", via="gowa") == "onboarding"
+
+        async with db.system_session() as session:
+            by_uid = await resolve_tenant(session, network=NETWORK_WHATSAPP, external_id="uid:US.1")
+        tenant = await tenant_by_phone(db, NL_PHONE)
+        assert tenant is not None
+        assert by_uid == tenant.id
+        assert tenant.onboarding_step == "connect"
+        assert len(await messages_of(db, tenant.id)) == 3
+
+
+class TestLogs:
+    async def test_onboarding_logs_neither_who_nor_what_nor_the_link(
+        self, person: Person, settings: Settings
+    ) -> None:
+        """Review Focus 4: the link is a bearer credential for the connect page."""
+        stream = io.StringIO()
+        configure_logging(settings, stream=stream)
+        await person.say("Oncology appointment with Dr Meyer")
+        await person.say("Mars")
+        await person.say("1")
+        await person.say("again please")
+
+        captured = stream.getvalue()
+        assert "inbound.handled" in captured
+        token = person.texts()[-1].rsplit("/", 1)[-1]
+        for leaked in (NL_PHONE, "31612345678", "Oncology appointment", "Mars", BASE_URL, token):
+            assert leaked not in captured

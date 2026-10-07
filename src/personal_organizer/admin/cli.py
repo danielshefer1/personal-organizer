@@ -36,7 +36,7 @@ from personal_organizer.db.repositories.invites import (
     list_invites,
     revoke_invite,
 )
-from personal_organizer.db.repositories.tenants import get_tenant, resolve_tenant
+from personal_organizer.db.repositories.tenants import get_tenant, resolve_tenant, set_status
 from personal_organizer.observability.logging import configure_logging
 from personal_organizer.settings import Settings, get_settings
 
@@ -118,6 +118,48 @@ async def revoke(db: Database, settings: Settings, raw_phone: str) -> int:
     return REFUSED
 
 
+async def suspend(db: Database, settings: Settings, raw_phone: str) -> int:
+    phone = parse_phone(raw_phone)
+    if phone is None:
+        return REFUSED
+    if phone in settings.whatsapp.allowlist:
+        _out("on WHATSAPP__ALLOWED_PHONES; remove it there first")
+        return REFUSED
+    tenant = await tenant_of(db, phone)
+    if tenant is None:
+        _out("not a member")
+        return REFUSED
+    if tenant.status == "suspended":
+        _out("already suspended")
+        return OK
+    async with db.tenant_session(TenantId(tenant.id)) as session:
+        await set_status(session, tenant.id, "suspended")
+    log.info("admin.tenant.suspended", tenant_id=str(tenant.id), sender=f"tel:{phone}")
+    _out(f"suspended {phone}; their next message gets the invite-only line")
+    return OK
+
+
+async def unsuspend(db: Database, settings: Settings, raw_phone: str) -> int:
+    del settings
+    phone = parse_phone(raw_phone)
+    if phone is None:
+        return REFUSED
+    tenant = await tenant_of(db, phone)
+    if tenant is None:
+        _out("not a member")
+        return REFUSED
+    if tenant.status != "suspended":
+        _out(f"not suspended ({tenant.status})")
+        return OK
+    # activate() clears the step, so no step means onboarding was finished.
+    restored = "active" if tenant.onboarding_step is None else "onboarding"
+    async with db.tenant_session(TenantId(tenant.id)) as session:
+        await set_status(session, tenant.id, restored)
+    log.info("admin.tenant.unsuspended", tenant_id=str(tenant.id), sender=f"tel:{phone}")
+    _out(f"{phone} is {restored} again")
+    return OK
+
+
 async def list_invites_command(db: Database, settings: Settings) -> int:
     del settings
     async with db.system_session() as session:
@@ -146,6 +188,12 @@ def _parser() -> argparse.ArgumentParser:
     invited.add_argument("--note", help="your label for them, e.g. Mom")
     revoked = commands.add_parser("revoke", help="cancel an invite nobody has used")
     revoked.add_argument("phone")
+    for name, text in (
+        ("suspend", "turn a member away; their messages get the invite-only line"),
+        ("unsuspend", "let a suspended member back in"),
+    ):
+        command = commands.add_parser(name, help=text)
+        command.add_argument("phone")
     commands.add_parser("list", help="every invite, newest first")
     return parser
 
@@ -157,6 +205,10 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
             return await invite(db, settings, args.phone, note=args.note)
         if args.command == "revoke":
             return await revoke(db, settings, args.phone)
+        if args.command == "suspend":
+            return await suspend(db, settings, args.phone)
+        if args.command == "unsuspend":
+            return await unsuspend(db, settings, args.phone)
         return await list_invites_command(db, settings)
     finally:
         await db.dispose()

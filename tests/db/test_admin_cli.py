@@ -12,9 +12,18 @@ import pytest
 
 from personal_organizer.admin import cli
 from personal_organizer.db.engine import Database
+from personal_organizer.messaging.inbound import handle_inbound
+from personal_organizer.messaging.replies import INVITE_ONLY_TEXT
 from personal_organizer.observability.logging import configure_logging
 from personal_organizer.settings import Settings
-from tests.fixtures.tenants import IL_PHONE, US_PHONE, new_tenant
+from tests.fixtures.channels import FakeOutbound, Spy, insert_inbox
+from tests.fixtures.tenants import (
+    IL_PHONE,
+    US_PHONE,
+    new_tenant,
+    tenant_by_phone,
+    with_onboarding,
+)
 
 pytestmark = [
     pytest.mark.db,
@@ -209,6 +218,10 @@ class TestMain:
         assert await asyncio.to_thread(cli.main, ["list"]) == 0
         assert await _invites(owner_conn) == [(IL_PHONE, "Mom", False, False)]
 
+    async def test_suspend_is_wired(self, capsys: pytest.CaptureFixture[str]) -> None:
+        assert await asyncio.to_thread(cli.main, ["suspend", IL_PHONE]) == 1
+        assert "not a member" in capsys.readouterr().out
+
 
 class TestLogs:
     async def test_invite_and_revoke_log_no_number_note_or_link(
@@ -223,4 +236,95 @@ class TestLogs:
         assert "admin.invite.revoked" in captured
         assert "sender_hash" in captured
         for leaked in (IL_PHONE, IL_PHONE.removeprefix("+"), "Mom", "wa.me"):
+            assert leaked not in captured
+
+
+class TestSuspend:
+    async def test_a_suspended_member_is_turned_away(
+        self, db: Database, admin_settings: Settings, owner_conn: Any
+    ) -> None:
+        """The whole point: their next message gets the invite-only line."""
+        await new_tenant(db, phone=IL_PHONE, status="active", step=None)
+        assert await cli.suspend(db, admin_settings, IL_PHONE) == 0
+        tenant = await tenant_by_phone(db, IL_PHONE)
+        assert tenant is not None
+        assert tenant.status == "suspended"
+
+        outbound = FakeOutbound(name="gowa")
+        disposition = await handle_inbound(
+            await insert_inbox(owner_conn, phone=IL_PHONE),
+            db=db,
+            channels={"gowa": outbound}.__getitem__,
+            allowlist=frozenset(),
+            on_allowed=Spy(),
+            settings=with_onboarding(admin_settings),
+        )
+        assert disposition == "stranger"
+        assert [m.body for m in outbound.sent] == [INVITE_ONLY_TEXT]
+
+    async def test_an_env_listed_number_cannot_be_suspended(
+        self,
+        db: Database,
+        admin_settings: Settings,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        await new_tenant(db, phone=OWNER_PHONE, status="active", step=None)
+        assert await cli.suspend(db, admin_settings, OWNER_PHONE) == 1
+        assert "on WHATSAPP__ALLOWED_PHONES; remove it there first" in capsys.readouterr().out
+        tenant = await tenant_by_phone(db, OWNER_PHONE)
+        assert tenant is not None
+        assert tenant.status == "active"
+
+    async def test_not_a_member(
+        self, db: Database, admin_settings: Settings, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert await cli.suspend(db, admin_settings, IL_PHONE) == 1
+        assert "not a member" in capsys.readouterr().out
+
+    async def test_suspending_twice_is_fine(
+        self, db: Database, admin_settings: Settings, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        await new_tenant(db, phone=IL_PHONE, status="suspended", step=None)
+        assert await cli.suspend(db, admin_settings, IL_PHONE) == 0
+        assert "already suspended" in capsys.readouterr().out
+
+
+class TestUnsuspend:
+    @pytest.mark.parametrize(("step", "restored"), [(None, "active"), ("connect", "onboarding")])
+    async def test_it_restores_the_status_from_the_onboarding_step(
+        self, db: Database, admin_settings: Settings, step: str | None, restored: str
+    ) -> None:
+        await new_tenant(db, phone=IL_PHONE, status="suspended", step=step)
+        assert await cli.unsuspend(db, admin_settings, IL_PHONE) == 0
+        tenant = await tenant_by_phone(db, IL_PHONE)
+        assert tenant is not None
+        assert (tenant.status, tenant.onboarding_step) == (restored, step)
+
+    async def test_a_member_who_is_not_suspended(
+        self, db: Database, admin_settings: Settings, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        await new_tenant(db, phone=IL_PHONE, status="active", step=None)
+        assert await cli.unsuspend(db, admin_settings, IL_PHONE) == 0
+        assert "not suspended (active)" in capsys.readouterr().out
+
+    async def test_not_a_member(
+        self, db: Database, admin_settings: Settings, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert await cli.unsuspend(db, admin_settings, IL_PHONE) == 1
+        assert "not a member" in capsys.readouterr().out
+
+
+class TestSuspendLogs:
+    async def test_suspend_and_unsuspend_log_no_number(
+        self, db: Database, admin_settings: Settings
+    ) -> None:
+        await new_tenant(db, phone=IL_PHONE, status="active", step=None)
+        stream = io.StringIO()
+        configure_logging(admin_settings, stream=stream)
+        await cli.suspend(db, admin_settings, IL_PHONE)
+        await cli.unsuspend(db, admin_settings, IL_PHONE)
+        captured = stream.getvalue()
+        assert "admin.tenant.suspended" in captured
+        assert "admin.tenant.unsuspended" in captured
+        for leaked in (IL_PHONE, IL_PHONE.removeprefix("+")):
             assert leaked not in captured

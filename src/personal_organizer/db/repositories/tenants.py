@@ -74,6 +74,11 @@ async def activate(session: AsyncSession, tenant_id: UUID) -> None:
     await _update(session, tenant_id, status="active", onboarding_step=None)
 
 
+async def set_status(session: AsyncSession, tenant_id: UUID, status: str) -> None:
+    """``suspended`` and back, from ``po-admin``. Onboarding's own move is :func:`activate`."""
+    await _update(session, tenant_id, status=status)
+
+
 async def primary_phone(session: AsyncSession, tenant_id: UUID) -> str | None:
     """The phone of the tenant's earliest identity that has one -- where a send that answers
     no inbound message goes (D10)."""
@@ -113,5 +118,6 @@ __all__ = [
     "primary_phone",
     "resolve_tenant",
     "set_onboarding_step",
+    "set_status",
     "set_timezone",
 ]

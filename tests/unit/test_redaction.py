@@ -183,3 +183,40 @@ class TestUnredactedEscapeHatch:
 
     def test_honoured_when_explicitly_allowed(self) -> None:
         assert "+31612345678" in _render({"note": Unredacted("+31612345678")}, allow_raw=True)
+
+
+class TestConnectUrls:
+    """Onboarding links carry a bearer token in their path, and Composio's callback our signed
+    state in its query. Both go by position, whatever the token's length or shape."""
+
+    @pytest.mark.parametrize(
+        "token",
+        ["abc.def.ghi", "eyJ0IjoiMSJ9.ZxY1aQ.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU"],
+    )
+    def test_a_link_token_is_removed(self, token: str) -> None:
+        assert (
+            scrub_text(f"GET https://po.test/connect/{token} 410")
+            == "GET https://po.test/connect/<redacted:link> 410"
+        )
+
+    def test_the_state_is_removed_and_the_account_id_kept(self) -> None:
+        assert (
+            scrub_text("/connect/callback?state=abc.def.ghi&connected_account_id=ca_1")
+            == "/connect/callback?state=<redacted:state>&connected_account_id=ca_1"
+        )
+
+    @pytest.mark.parametrize(
+        "value", ["/connect/{token}", "/connect/callback", "/webhooks/gowa", "disconnect/now"]
+    )
+    def test_route_templates_and_other_paths_survive(self, value: str) -> None:
+        assert scrub_text(value) == value
+
+    def test_a_logged_path_is_scrubbed(self) -> None:
+        rendered = _render({"event": "request.invalid", "path": "/connect/abc.def.ghi"})
+        assert "abc.def.ghi" not in rendered
+
+    def test_a_connection_id_survives_for_correlation(self) -> None:
+        connection_id = str(uuid4())
+        assert connection_id in _render(
+            {"event": "connect.connected", "connection_id": connection_id}
+        )

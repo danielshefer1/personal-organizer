@@ -145,6 +145,21 @@ class TestScrubEvent:
         scrubbed: Any = scrub_event({"extra": deep}, {})
         assert "<redacted:depth>" in _flatten(scrubbed)
 
+    def test_connect_tokens_are_removed_from_request_urls(self) -> None:
+        """D4: the link token is in the URL's path, the callback's state in its query."""
+        token = "abc.def.ghi"
+        event: Any = {
+            "transaction": "/connect/{token}",
+            "request": {
+                "url": f"https://po.test/connect/{token}",
+                "query_string": f"state={token}&connected_account_id=ca_1",
+            },
+        }
+        scrubbed: Any = scrub_event(event, {})
+        assert all(token not in text for text in _flatten(scrubbed))
+        assert scrubbed["transaction"] == "/connect/{token}"
+        assert scrubbed["request"]["query_string"].endswith("&connected_account_id=ca_1")
+
 
 class TestScrubBreadcrumb:
     @pytest.mark.parametrize("secret", PATTERN_PII)

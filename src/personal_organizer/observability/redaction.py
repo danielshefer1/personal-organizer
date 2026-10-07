@@ -151,6 +151,7 @@ SAFE_KEYS: Final = frozenset(
         "channel",
         "inbox_id",
         "outbox_id",
+        "connection_id",
         "message_type",
         "delivery_status",
         "disposition",
@@ -161,6 +162,7 @@ SAFE_KEYS: Final = frozenset(
         "skipped_count",
         "whatsapp_enabled",
         "gowa_enabled",
+        "composio_enabled",
         "channels",
         "allowlist_size",
         # db -- infrastructure coordinates, so that a connection failure says which host it
@@ -211,6 +213,9 @@ OPAQUE_ID_KEYS: Final = frozenset(
         # instead of the provider's message id.
         "inbox_id",
         "outbox_id",
+        # Our UUID for a calendar connection: what the connect callback and the
+        # onboarding:connected task log to tie a page view to the message that followed.
+        "connection_id",
     }
 )
 
@@ -231,6 +236,13 @@ _HEX_SHAPE = re.compile(r"\A[0-9a-fA-F]{16,64}\Z")
 # no content-detecting regex can save us there, so the argument list is dropped wholesale.
 # The architectural counterpart is in docs/adr/0001: task kwargs carry ids, never content.
 _CALL_STRING = re.compile(r"([\w.:-]+\[\d+\])\([^)]*\)")
+
+# Onboarding links carry a bearer token in their path (/connect/<token>), and Composio's
+# callback our signed state in its query (?state=<token>). The token rules below would catch
+# today's shape by length; these catch it by position. A route template (/connect/{token}) and
+# the callback path itself are kept.
+_CONNECT_TOKEN = re.compile(r"(/connect/)(?!callback\b|\{)[^/?#\s\"'<>]+")
+_STATE_PARAM = re.compile(r"(\bstate=)[^&#\s\"'<>]+")
 
 
 def _luhn_ok(digits: str) -> bool:
@@ -262,6 +274,8 @@ def scrub_text(value: str) -> str:
     land in a log line even if some future key is allowlisted by mistake.
     """
     value = _CALL_STRING.sub(r"\1(<redacted:args>)", value)
+    value = _CONNECT_TOKEN.sub(r"\1<redacted:link>", value)
+    value = _STATE_PARAM.sub(r"\1<redacted:state>", value)
     value = _JWT.sub("<redacted:jwt>", value)
     value = _EMAIL.sub("<redacted:email>", value)
     value = _IBAN.sub("<redacted:iban>", value)

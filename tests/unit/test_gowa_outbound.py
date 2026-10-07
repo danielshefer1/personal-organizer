@@ -26,6 +26,7 @@ from personal_organizer.providers.channel.gowa.outbound import (
     REACHOUT_TIMELOCK_CODE,
     GowaOutbound,
 )
+from personal_organizer.settings import GowaSettings
 
 BASE = "http://gowa.railway.internal:3000"
 OK_SEND = {
@@ -41,6 +42,9 @@ class Recorder:
         self.respond = respond
         self.requests: list[httpx.Request] = []
         self.sleeps: list[float] = []
+        self.draws: list[tuple[float, float]] = []
+        #: What the stubbed random draw returns: the jitter's upper bound, scaled by this.
+        self.draw_fraction = 0.5
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -48,6 +52,10 @@ class Recorder:
 
     async def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
+
+    def uniform(self, low: float, high: float) -> float:
+        self.draws.append((low, high))
+        return low + (high - low) * self.draw_fraction
 
     @property
     def paths(self) -> list[str]:
@@ -58,6 +66,7 @@ def _channel(
     respond: Callable[[httpx.Request], httpx.Response],
     *,
     typing_delay_s: float = 0.0,
+    typing_jitter_s: float = 0.0,
     device_id: str | None = None,
 ) -> tuple[GowaOutbound, Recorder]:
     recorder = Recorder(respond)
@@ -65,7 +74,12 @@ def _channel(
         base_url=BASE, auth=("po", "pw"), transport=httpx.MockTransport(recorder)
     )
     channel = GowaOutbound(
-        http, device_id=device_id, typing_delay_s=typing_delay_s, sleep=recorder.sleep
+        http,
+        device_id=device_id,
+        typing_delay_s=typing_delay_s,
+        typing_jitter_s=typing_jitter_s,
+        sleep=recorder.sleep,
+        uniform=recorder.uniform,
     )
     return channel, recorder
 
@@ -119,6 +133,37 @@ class TestRequests:
             "action": "start",
         }
         assert recorder.sleeps == [1.5]
+
+    async def test_the_pause_gets_a_random_extra(self) -> None:
+        channel, recorder = _channel(_json(200, OK_SEND), typing_delay_s=3.0, typing_jitter_s=2.0)
+        await channel.send_text(MESSAGE)
+
+        assert recorder.draws == [(0.0, 2.0)]
+        assert recorder.sleeps == [4.0]
+
+    async def test_each_reply_draws_its_own_pause(self) -> None:
+        channel, recorder = _channel(_json(200, OK_SEND), typing_delay_s=3.0, typing_jitter_s=2.0)
+        await channel.send_text(MESSAGE)
+        recorder.draw_fraction = 1.0
+        await channel.send_text(MESSAGE)
+
+        assert recorder.sleeps == [4.0, 5.0]
+
+    async def test_jitter_alone_still_types_and_pauses(self) -> None:
+        channel, recorder = _channel(_json(200, OK_SEND), typing_jitter_s=2.0)
+        await channel.send_text(MESSAGE)
+
+        assert recorder.paths == ["/send/chat-presence", "/send/message"]
+        assert recorder.sleeps == [1.0]
+
+    async def test_the_pause_comes_from_settings(self) -> None:
+        recorder = Recorder(_json(200, OK_SEND))
+        http = httpx.AsyncClient(base_url=BASE, transport=httpx.MockTransport(recorder))
+        channel = GowaOutbound.from_settings(
+            GowaSettings(typing_delay_s=2.5, typing_jitter_s=1.5), http
+        )
+        assert channel._typing_delay_s == 2.5
+        assert channel._typing_jitter_s == 1.5
 
     async def test_a_failed_typing_indicator_does_not_stop_the_reply(self) -> None:
         def respond(request: httpx.Request) -> httpx.Response:

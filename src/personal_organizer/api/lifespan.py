@@ -51,12 +51,20 @@ def make_lifespan(
                 procrastinate_app, pepper=settings.logging.pii_pepper.get_secret_value()
             )
 
+            if settings.composio.enabled:
+                # Imported here: the SDK pulls in openai and takes seconds to import, which a
+                # deploy without Composio should not pay at every start.
+                from personal_organizer.providers.calendar.composio import ComposioConnector
+
+                app.state.connect_linker = ComposioConnector.from_settings(settings.composio)
+
             log.info(
                 "api.started",
                 env=settings.app.env,
                 release=settings.app.release,
                 whatsapp_enabled=settings.whatsapp.enabled,
                 gowa_enabled=settings.gowa.enabled,
+                composio_enabled=settings.composio.enabled,
             )
             yield
             log.info("api.stopping")

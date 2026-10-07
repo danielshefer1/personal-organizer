@@ -14,7 +14,7 @@ from starlette.status import HTTP_422_UNPROCESSABLE_CONTENT, HTTP_500_INTERNAL_S
 from personal_organizer import __version__
 from personal_organizer.api.lifespan import make_lifespan
 from personal_organizer.api.middleware import RequestContextMiddleware
-from personal_organizer.api.routers import health, internal, webhooks
+from personal_organizer.api.routers import connect, health, internal, webhooks
 from personal_organizer.providers.channel.gowa.inbound import GowaInbound
 from personal_organizer.providers.channel.whatsapp.inbound import WhatsAppInbound
 from personal_organizer.settings import Settings
@@ -58,6 +58,9 @@ def create_app(settings: Settings) -> FastAPI:
     if settings.gowa.enabled:
         inbound.append(GowaInbound.from_settings(settings.gowa))
         app.include_router(webhooks.gowa_router)
+    # The connect pages and Composio's callback, under the same rule: off until configured.
+    if settings.composio.enabled:
+        app.include_router(connect.router)
     app.state.inbound_channels = {channel.name: channel for channel in inbound}
 
     @app.exception_handler(RequestValidationError)

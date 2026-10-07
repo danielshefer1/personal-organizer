@@ -195,22 +195,24 @@ async def complete_connect(
         return Refused("auth_config_mismatch")
     if account.status != ACCOUNT_ACTIVE:
         return Refused("not_active")
-    try:
-        async with db.tenant_session(TenantId(tenant_id)) as session:
-            tenant = await get_tenant(session, tenant_id)
-            if tenant is None or tenant.status not in _BINDABLE:
-                return Refused("tenant_unavailable")
+    async with db.tenant_session(TenantId(tenant_id)) as session:
+        tenant = await get_tenant(session, tenant_id)
+        if tenant is None or tenant.status not in _BINDABLE:
+            return Refused("tenant_unavailable")
+        try:
             connection = await bind_connection(
                 session,
                 tenant_id,
                 connected_account_id=account.id,
                 auth_config_id=account.auth_config_id,
             )
-            await activate(session, tenant_id)
-    except LookupError:
-        # Another tenant holds this account. Caught outside the session so the whole
-        # transaction rolls back: no activation, and neither tenant's rows change.
-        return Refused(ACCOUNT_CONFLICT, tenant_id)
+        except LookupError:
+            # Only this call: KeyError and friends are LookupErrors too, and a fault in
+            # get_tenant or activate must propagate, not pose as a conflict. Here another
+            # tenant holds the account. bind_connection's savepoint has already undone its
+            # own writes, so what the session commits is a read. No activation.
+            return Refused(ACCOUNT_CONFLICT, tenant_id)
+        await activate(session, tenant_id)
     return Connected(tenant_id=tenant_id, connection_id=connection.id, language=tenant.language)
 
 

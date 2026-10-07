@@ -13,6 +13,7 @@ from uuid import UUID
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
+from structlog.testing import capture_logs
 
 from personal_organizer.core.errors import CalendarProviderUnavailableError
 from personal_organizer.core.types import TenantId
@@ -398,7 +399,11 @@ class TestCallback:
         ]
 
     async def test_a_failed_defer_still_shows_connected(
-        self, connect_settings: Settings, db: Database, linker: FakeConnectLinker
+        self,
+        connect_settings: Settings,
+        db: Database,
+        linker: FakeConnectLinker,
+        queue: FakeProcrastinate,
     ) -> None:
         """The tenant is bound and active. The page says so, and a reload re-defers."""
         application = connect_app(
@@ -411,5 +416,45 @@ class TestCallback:
             linker.accounts[ACCOUNT_ID] = account(tenant_id)
             response = await client.get(url)
 
-        assert response.status_code == 200
-        assert (await tenant_row(db, tenant_id)).status == "active"
+            assert response.status_code == 200
+            assert_page(response, "connected", "he")
+            assert_hardened(response)
+            assert (await tenant_row(db, tenant_id)).status == "active"
+
+            # The reload, with a working queue, mends it: one job for the one connection.
+            application.state.procrastinate = queue
+            assert (await client.get(url)).status_code == 200
+            [connection] = await connections(db, tenant_id)
+            assert queue.calls == [
+                DeferredCall(
+                    ONBOARDING_CONNECTED_TASK,
+                    {},
+                    {"tenant_id": str(tenant_id), "connection_id": str(connection.id)},
+                )
+            ]
+
+    async def test_a_fault_in_activate_is_not_taken_for_a_conflict(
+        self,
+        http: AsyncClient,
+        db: Database,
+        linker: FakeConnectLinker,
+        queue: FakeProcrastinate,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """KeyError is a LookupError. Only bind_connection's refusal is the conflict."""
+
+        async def broken(*_args: object, **_kwargs: object) -> None:
+            raise KeyError("boom")
+
+        tenant_id = await seed_tenant(db)
+        url = await callback_url(http, db, linker, tenant_id)
+        linker.accounts[ACCOUNT_ID] = account(tenant_id)
+        monkeypatch.setattr("personal_organizer.onboarding.connect.activate", broken)
+
+        with capture_logs() as logs:
+            response = await http.get(url)
+
+        assert response.status_code == 500
+        assert not [entry for entry in logs if entry["event"] == "connect.account_conflict"]
+        assert queue.calls == []
+        assert (await tenant_row(db, tenant_id)).status == "onboarding"

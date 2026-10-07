@@ -9,13 +9,21 @@ from __future__ import annotations
 
 import html
 import secrets
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Final
+from typing import Any, Final
 from uuid import UUID, uuid4
 
 import httpx
+import pytest
+import sentry_sdk
 from fastapi import FastAPI
+from itsdangerous import TimestampSigner
 from pydantic import SecretStr
+from sentry_sdk.envelope import Envelope
+from sentry_sdk.transport import Transport
 from sqlalchemy import insert, update
 
 from personal_organizer.api.app import create_app
@@ -33,6 +41,7 @@ from personal_organizer.db.repositories.tenants import (
     set_onboarding_step,
 )
 from personal_organizer.interfaces.calendar import ACCOUNT_ACTIVE, ConnectedAccount
+from personal_organizer.observability.sentry import scrub_event
 from personal_organizer.onboarding.page_text import page_text
 from personal_organizer.onboarding.tokens import LINK_SALT, STATE_SALT, TokenPayload, sign
 from personal_organizer.settings import ComposioSettings, OnboardingSettings, Settings
@@ -133,6 +142,44 @@ def state_token(
 ) -> str:
     payload = TokenPayload(tenant_id=tenant_id or uuid4(), nonce=nonce)
     return sign(payload, secret=secret, salt=STATE_SALT)
+
+
+def stale(make: Callable[[], str], *, age_s: int = 7200) -> str:
+    """A token signed ``age_s`` ago, by default two hours: past both the link's and the
+    state's max age, and well inside the age at which we still recognise one as ours."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(TimestampSigner, "get_timestamp", lambda _self: int(time.time()) - age_s)
+        return make()
+
+
+class _CapturingTransport(Transport):
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.events = events
+
+    def capture_envelope(self, envelope: Envelope) -> None:
+        for item in envelope.items:
+            if item.type == "event" and item.payload.json is not None:
+                self.events.append(item.payload.json)
+
+
+@contextmanager
+def sentry_events() -> Iterator[list[dict[str, Any]]]:
+    """Every event Sentry would send while the block runs, after our ``before_send``."""
+    events: list[dict[str, Any]] = []
+    client = sentry_sdk.Client(
+        dsn="https://key@o0.ingest.sentry.io/0",
+        transport=_CapturingTransport(events),
+        before_send=scrub_event,
+        default_integrations=False,
+    )
+    scope = sentry_sdk.get_global_scope()
+    previous = scope.client
+    scope.set_client(client)
+    try:
+        yield events
+    finally:
+        scope.set_client(previous)
 
 
 def connect_app(

@@ -36,6 +36,16 @@ PAGE_TEXT: Final[dict[str, dict[str, dict[str, str]]]] = {
         "he": {"title": "היומן מחובר", "body": "הכול מוכן. אפשר לחזור לוואטסאפ."},
         "en": {"title": "Calendar connected", "body": "All set. You can go back to WhatsApp now."},
     },
+    "already_connected": {
+        "he": {
+            "title": "היומן כבר מחובר",
+            "body": "אין צורך בקישור הזה. אפשר לחזור לוואטסאפ.",
+        },
+        "en": {
+            "title": "Your calendar is already connected",
+            "body": "There is nothing more to do with this link. You can go back to WhatsApp.",
+        },
+    },
     "link_unusable": {
         "he": {
             "title": "הקישור כבר לא בתוקף",

@@ -17,6 +17,10 @@ from personal_organizer.core.types import TenantId
 
 #: The one connected-account status that means "tokens held, calls will work".
 ACCOUNT_ACTIVE: Final = "ACTIVE"
+#: Statuses on the way to ``ACTIVE``: the user is still at Google, or Composio is still
+#: exchanging the code. Every other status (``FAILED``, ``EXPIRED``, ``INACTIVE``,
+#: ``REVOKED``, and any Composio adds) will not turn ``ACTIVE`` by waiting.
+ACCOUNT_CONNECTING: Final = frozenset({"INITIALIZING", "INITIATED"})
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,7 @@ class CalendarProvider(Protocol):
 
 __all__ = [
     "ACCOUNT_ACTIVE",
+    "ACCOUNT_CONNECTING",
     "CalendarEvent",
     "CalendarProvider",
     "ConnectLinker",

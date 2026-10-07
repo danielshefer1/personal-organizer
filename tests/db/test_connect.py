@@ -7,7 +7,7 @@ import html
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import UUID
 
 import pytest
@@ -41,10 +41,14 @@ from tests.fixtures.connect import (
     assert_hardened,
     assert_page,
     connect_app,
+    link_token,
     make_active,
     seed_inbound,
     seed_link,
     seed_tenant,
+    sentry_events,
+    stale,
+    state_token,
     suspend,
     with_connect,
 )
@@ -143,14 +147,33 @@ class TestConnectPage:
         assert after == before
         assert after[0][1] is None
 
-    async def test_a_tenant_already_connected_is_refused(
+    @pytest.mark.parametrize("age", ["fresh", "past_its_ttl"])
+    async def test_a_tenant_already_connected_is_told_so(
+        self, http: AsyncClient, db: Database, linker: FakeConnectLinker, age: str
+    ) -> None:
+        """Not "this link has expired, send a message for a new one": the bot only acks an
+        active tenant, so that page would send them round in a circle."""
+        tenant_id = await seed_tenant(db, language="en")
+        token = await seed_link(db, tenant_id)
+        if age == "past_its_ttl":
+            token = stale(lambda: link_token(tenant_id))
+        await make_active(db, tenant_id)
+        for response in (await http.get(f"/connect/{token}"), await http.post(f"/connect/{token}")):
+            assert response.status_code == 200
+            assert_page(response, "already_connected", "en")
+            assert page_text("already_connected", "he")["title"] not in response.text
+            assert_hardened(response)
+        assert linker.links == []
+
+    async def test_an_expired_link_of_a_tenant_still_onboarding_is_refused(
         self, http: AsyncClient, db: Database, linker: FakeConnectLinker
     ) -> None:
         tenant_id = await seed_tenant(db)
-        token = await seed_link(db, tenant_id)
-        await make_active(db, tenant_id)
-        assert (await http.get(f"/connect/{token}")).status_code == 410
-        assert (await http.post(f"/connect/{token}")).status_code == 410
+        await seed_link(db, tenant_id)
+        token = stale(lambda: link_token(tenant_id))
+        for response in (await http.get(f"/connect/{token}"), await http.post(f"/connect/{token}")):
+            assert response.status_code == 410
+            assert_page(response, "link_unusable", "he", "en")
         assert linker.links == []
 
 
@@ -258,6 +281,28 @@ async def connections(db: Database, tenant_id: UUID) -> list[CalendarConnection]
             select(CalendarConnection).order_by(CalendarConnection.connected_at)
         )
         return list(rows.all())
+
+
+def late(url: str, *, age_s: int = 7200) -> str:
+    """``url`` with its state re-signed ``age_s`` ago: by default past STATE_MAX_AGE_S."""
+    parts = urlsplit(url)
+    query = parse_qs(parts.query)
+    [state] = query["state"]
+    payload = verify(state, secret=LINK_SECRET, salt=STATE_SALT, max_age_s=3600)
+    assert payload is not None
+    old = stale(lambda: state_token(payload.tenant_id, nonce=payload.nonce), age_s=age_s)
+    query["state"] = [old]
+    return f"{parts.path}?{urlencode(query, doseq=True)}"
+
+
+async def wait_for_a_lock_wait(owner_conn: Any) -> None:
+    """Until some backend waits on a lock: the callback's insert, on our uncommitted row."""
+    for _ in range(500):
+        if await owner_conn.fetchval("SELECT count(*) FROM pg_locks WHERE NOT granted"):
+            return
+        await asyncio.sleep(0.01)
+    msg = "the callback never waited on the uncommitted row"
+    raise AssertionError(msg)
 
 
 class TestCallback:
@@ -386,11 +431,18 @@ class TestCallback:
         url = await callback_url(http, db, linker, tenant_a)
         linker.accounts[ACCOUNT_ID] = account(tenant_a)
 
-        response = await http.get(url)
+        with sentry_events() as events:
+            response = await http.get(url)
 
         assert response.status_code == 409
         assert_page(response, "failed", "he", "en")
         assert_hardened(response)
+        # Logging does not reach Sentry (event_level=None), so the conflict is sent there.
+        [event] = events
+        assert (event["message"], event["level"]) == ("connect.account_conflict", "error")
+        assert event["fingerprint"] == ["connect.account_conflict"]
+        assert event["tags"] == {"tenant_id": str(tenant_a)}
+        assert ACCOUNT_ID not in str(event)
         assert (await tenant_row(db, tenant_a)).status == "onboarding"
         assert await connections(db, tenant_a) == []
         assert queue.calls == []
@@ -433,6 +485,99 @@ class TestCallback:
                 )
             ]
 
+    async def test_a_late_reload_of_a_connected_tenant_still_says_connected(
+        self, http: AsyncClient, db: Database, linker: FakeConnectLinker, queue: FakeProcrastinate
+    ) -> None:
+        """The tab reloaded after the state's hour: no lookup, no bind, no second message."""
+        tenant_id = await seed_tenant(db, language="en")
+        url = await callback_url(http, db, linker, tenant_id)
+        linker.accounts[ACCOUNT_ID] = account(tenant_id)
+        assert (await http.get(url)).status_code == 200
+        before = [(c.id, c.status) for c in await connections(db, tenant_id)]
+        linker.lookups.clear()
+        queue.calls.clear()
+
+        response = await http.get(late(url))
+
+        assert response.status_code == 200
+        assert_page(response, "connected", "en")
+        assert_hardened(response)
+        assert linker.lookups == []
+        assert queue.calls == []
+        assert [(c.id, c.status) for c in await connections(db, tenant_id)] == before
+
+    async def test_a_late_callback_for_a_tenant_not_connected_fails(
+        self, http: AsyncClient, db: Database, linker: FakeConnectLinker, queue: FakeProcrastinate
+    ) -> None:
+        tenant_id = await seed_tenant(db)
+        url = await callback_url(http, db, linker, tenant_id)
+        linker.accounts[ACCOUNT_ID] = account(tenant_id)
+
+        response = await http.get(late(url))
+
+        assert response.status_code == 400
+        assert_page(response, "failed", "he", "en")
+        assert linker.lookups == []
+        assert queue.calls == []
+        assert await connections(db, tenant_id) == []
+        assert (await tenant_row(db, tenant_id)).status == "onboarding"
+
+    async def test_a_late_callback_for_an_active_tenant_with_no_connection_fails(
+        self, http: AsyncClient, db: Database, linker: FakeConnectLinker
+    ) -> None:
+        tenant_id = await seed_tenant(db)
+        url = await callback_url(http, db, linker, tenant_id)
+        await make_active(db, tenant_id)
+        response = await http.get(late(url))
+        assert response.status_code == 400
+        assert_page(response, "failed", "he", "en")
+
+    async def test_a_callback_past_recognition_fails(
+        self, http: AsyncClient, db: Database, linker: FakeConnectLinker
+    ) -> None:
+        tenant_id = await seed_tenant(db)
+        url = await callback_url(http, db, linker, tenant_id)
+        linker.accounts[ACCOUNT_ID] = account(tenant_id)
+        assert (await http.get(url)).status_code == 200
+        response = await http.get(late(url, age_s=31 * 24 * 3600))
+        assert response.status_code == 400
+        assert_page(response, "failed", "he", "en")
+
+    async def test_two_accounts_binding_at_once_ask_for_a_reload(
+        self,
+        http: AsyncClient,
+        db: Database,
+        linker: FakeConnectLinker,
+        queue: FakeProcrastinate,
+        owner_conn: Any,
+    ) -> None:
+        """Two callbacks for different accounts of one tenant, at the same moment. The loser's
+        insert waits on the winner's uncommitted active row, then violates the one-active-per-
+        tenant index. It gets a reload page, and the reload binds cleanly."""
+        tenant_id = await seed_tenant(db)
+        url = await callback_url(http, db, linker, tenant_id)
+        linker.accounts[ACCOUNT_ID] = account(tenant_id)
+
+        async with db.tenant_session(TenantId(tenant_id)) as session:
+            await bind_connection(
+                session, tenant_id, connected_account_id="ca_winner", auth_config_id=AUTH_CONFIG_ID
+            )
+            loser = asyncio.create_task(http.get(url))
+            await wait_for_a_lock_wait(owner_conn)
+        response = await loser
+
+        assert response.status_code == 503
+        assert_page(response, "unavailable_retry", "he", "en")
+        assert_hardened(response)
+        assert queue.calls == []
+        statuses = {c.connected_account_id: c.status for c in await connections(db, tenant_id)}
+        assert statuses == {"ca_winner": "active"}
+
+        reload = await http.get(url)
+        assert reload.status_code == 200
+        statuses = {c.connected_account_id: c.status for c in await connections(db, tenant_id)}
+        assert statuses == {"ca_winner": "revoked", ACCOUNT_ID: "active"}
+
     async def test_a_fault_in_activate_is_not_taken_for_a_conflict(
         self,
         http: AsyncClient,
@@ -455,6 +600,11 @@ class TestCallback:
             response = await http.get(url)
 
         assert response.status_code == 500
+        assert_page(response, "unavailable_retry", "he", "en")
+        assert_hardened(response)
         assert not [entry for entry in logs if entry["event"] == "connect.account_conflict"]
+        assert [entry["error_type"] for entry in logs if entry["event"] == "connect.failed"] == [
+            "KeyError"
+        ]
         assert queue.calls == []
         assert (await tenant_row(db, tenant_id)).status == "onboarding"

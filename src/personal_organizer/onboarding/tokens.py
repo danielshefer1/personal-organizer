@@ -7,7 +7,9 @@ accepted as callback state, or the other way round, even though one secret signs
 The signature proves that we issued the token and when. It does not make the token
 single-use. That is the ``onboarding_links`` row keyed on ``nonce`` (``consume_link``). The
 row's ``expires_at`` is the authority on expiry. ``max_age_s`` here is a second, cheaper
-bound, checked before the database is touched.
+bound, checked before the database is touched. The connect flow also verifies with a much
+longer one, to recognise an expired token as ours and pick the page an active tenant sees
+(``onboarding.connect.RECOGNISED_MAX_AGE_S``); such a token is never used for anything else.
 
 The payload is signed, not encrypted: anyone holding the link can read the tenant id. It is
 a random UUID that identifies nobody outside our database, and the link is a bearer

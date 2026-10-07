@@ -14,22 +14,30 @@ to the log, as a fixed word.
 
 ``/callback`` is declared before ``/{token}``. Routes match in order, and ``{token}`` would
 otherwise take "callback" as a token.
+
+A fault nobody planned for still gets a page with D4's headers (:class:`_ConnectRoute`), not
+Starlette's bare 500.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
-from typing import Final
+from typing import Any, Final
 
 import procrastinate
 import sentry_sdk
 import structlog
 from fastapi import APIRouter, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
+from starlette.exceptions import HTTPException
 from starlette.status import (
     HTTP_200_OK,
     HTTP_400_BAD_REQUEST,
     HTTP_409_CONFLICT,
     HTTP_410_GONE,
+    HTTP_500_INTERNAL_SERVER_ERROR,
     HTTP_503_SERVICE_UNAVAILABLE,
 )
 
@@ -41,6 +49,9 @@ from personal_organizer.core.errors import (
 )
 from personal_organizer.onboarding.connect import (
     ACCOUNT_CONFLICT,
+    BIND_RACE,
+    NOT_READY,
+    AlreadyConnected,
     ConnectConfig,
     Connected,
     Refused,
@@ -52,14 +63,41 @@ from personal_organizer.worker.tasks.onboarding import ONBOARDING_CONNECTED_TASK
 
 log = structlog.get_logger(__name__)
 
-router = APIRouter(prefix="/connect", tags=["connect"])
+
+class _ConnectRoute(APIRoute):
+    """Answers an unexpected exception with a page, through :mod:`pages`, and tells Sentry.
+
+    A POST may already have spent the link, so its page asks for a new one. A GET can be
+    reloaded. FastAPI's own HTTP and validation errors keep their handlers.
+    """
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def guarded(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except HTTPException, RequestValidationError:
+                raise
+            except Exception as exc:
+                sentry_sdk.capture_exception(exc)
+                log.error("connect.failed", error_type=type(exc).__name__)
+                page = "unavailable_new_link" if request.method == "POST" else "unavailable_retry"
+                return pages.message_page(page, status_code=HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return guarded
+
+
+router = APIRouter(prefix="/connect", tags=["connect"], route_class=_ConnectRoute)
 
 #: Composio appends the account id to our callback URL. The snake_case name is the one its API
 #: uses everywhere else. The camelCase one is accepted too, until the day-1 staging run shows
 #: which arrives.
 _ACCOUNT_ID_PARAMS: Final = ("connected_account_id", "connectedAccountId")
 #: The page for each refusal that is not "ask the bot for a new link".
-_REFUSAL_PAGES: Final = {"not_active": "not_ready"}
+_REFUSAL_PAGES: Final = {NOT_READY: "not_ready"}
+#: Sentry groups every account conflict as one issue, whoever it happened to.
+_CONFLICT_FINGERPRINT: Final = ("connect.account_conflict",)
 
 
 def _account_id(request: Request) -> str | None:
@@ -113,12 +151,11 @@ async def connect_callback(
         )
         return pages.message_page("failed", status_code=HTTP_400_BAD_REQUEST)
     if isinstance(outcome, Refused):
-        if outcome.reason == ACCOUNT_CONFLICT:
-            log.error("connect.account_conflict", tenant_id=str(outcome.tenant_id))
-            return pages.message_page("failed", status_code=HTTP_409_CONFLICT)
-        log.warning("connect.callback_refused", reason=outcome.reason)
-        page = _REFUSAL_PAGES.get(outcome.reason, "failed")
-        return pages.message_page(page, status_code=HTTP_400_BAD_REQUEST)
+        return _refused(outcome)
+    if isinstance(outcome, AlreadyConnected):
+        # A late reload: nothing bound, and nothing deferred, so no second message.
+        log.info("connect.callback_already_connected", tenant_id=str(outcome.tenant_id))
+        return pages.message_page("connected", status_code=HTTP_200_OK, language=outcome.language)
     await _defer_all_set(queue, outcome)
     log.info(
         "connect.connected",
@@ -128,19 +165,49 @@ async def connect_callback(
     return pages.message_page("connected", status_code=HTTP_200_OK, language=outcome.language)
 
 
+def _refused(outcome: Refused) -> Response:
+    tenant = {"tenant_id": str(outcome.tenant_id)} if outcome.tenant_id is not None else {}
+    if outcome.reason == ACCOUNT_CONFLICT:
+        # Logging stops short of Sentry (LoggingIntegration(event_level=None)), and this one
+        # needs a person: D5's user_id check should make it unreachable.
+        sentry_sdk.capture_message(
+            "connect.account_conflict",
+            level="error",
+            fingerprint=list(_CONFLICT_FINGERPRINT),
+            tags=tenant,
+        )
+        log.error("connect.account_conflict", **tenant)
+        return pages.message_page("failed", status_code=HTTP_409_CONFLICT)
+    if outcome.reason == BIND_RACE:
+        log.warning("connect.bind_race", **tenant)
+        return pages.message_page("unavailable_retry", status_code=HTTP_503_SERVICE_UNAVAILABLE)
+    log.warning("connect.callback_refused", reason=outcome.reason, **tenant)
+    page = _REFUSAL_PAGES.get(outcome.reason, "failed")
+    return pages.message_page(page, status_code=HTTP_400_BAD_REQUEST)
+
+
+def _already_connected(outcome: AlreadyConnected) -> Response:
+    log.info("connect.already_connected", tenant_id=str(outcome.tenant_id))
+    return pages.message_page(
+        "already_connected", status_code=HTTP_200_OK, language=outcome.language
+    )
+
+
 @router.get("/{token}", summary="The connect page. Reads only: link previews fetch it.")
 async def connect_page(token: str, db: DbDep, settings: SettingsDep) -> Response:
     page = await open_link(token, db=db, config=ConnectConfig.of(settings))
     if page is None:
         log.info("connect.page_refused")
         return pages.message_page("link_unusable", status_code=HTTP_410_GONE)
+    if isinstance(page, AlreadyConnected):
+        return _already_connected(page)
     return pages.connect_page(token=token, language=page.language, phone_suffix=page.phone_suffix)
 
 
 @router.post("/{token}", summary="Spend the link and send the browser to Composio.")
 async def start(token: str, db: DbDep, linker: ConnectLinkerDep, settings: SettingsDep) -> Response:
     try:
-        redirect_url = await start_connect(
+        outcome = await start_connect(
             token,
             db=db,
             linker=linker,
@@ -159,11 +226,13 @@ async def start(token: str, db: DbDep, linker: ConnectLinkerDep, settings: Setti
             status_code=exc.status_code,
         )
         return pages.message_page("unavailable_new_link", status_code=HTTP_503_SERVICE_UNAVAILABLE)
-    if redirect_url is None:
+    if outcome is None:
         log.info("connect.link_refused")
         return pages.message_page("link_unusable", status_code=HTTP_410_GONE)
+    if isinstance(outcome, AlreadyConnected):
+        return _already_connected(outcome)
     log.info("connect.redirected")
-    return pages.redirect(redirect_url)
+    return pages.redirect(outcome)
 
 
 __all__ = ["router"]

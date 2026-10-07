@@ -1,0 +1,174 @@
+"""``send_once`` claimed on an idempotency key (D6): every ADR 0003 path, for a send that
+answers no inbound message. The ``(inbox_id, kind)`` paths are pinned in
+``test_handle_inbound.py``."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from typing import Any
+from uuid import UUID
+
+import pytest
+
+from personal_organizer.core.errors import (
+    AmbiguousDeliveryError,
+    RejectedChannelError,
+    TransientChannelError,
+)
+from personal_organizer.db.engine import Database
+from personal_organizer.interfaces.channel import OutboundMessage
+from personal_organizer.messaging.outbox import send_once
+from personal_organizer.settings import Settings
+from tests.fixtures.channels import FakeOutbound, insert_inbox
+from tests.fixtures.payloads import SENDER_PHONE
+
+pytestmark = [pytest.mark.db, pytest.mark.usefixtures("clean_channel_tables")]
+
+KEY = "connected:0b7c2c84"
+KIND = "onboarding:all_set"
+TEXT = "You're all set! Your Google Calendar is connected."
+RECIPIENT = f"tel:{SENDER_PHONE}"
+
+
+@pytest.fixture
+async def db(db_settings: Settings, owner_conn: Any) -> AsyncIterator[Database]:
+    database = Database(db_settings)
+    try:
+        yield database
+    finally:
+        await database.dispose()
+
+
+async def _send(db: Database, channel: FakeOutbound, *, key: str = KEY, kind: str = KIND) -> str:
+    return await send_once(
+        db,
+        channel,
+        inbox_id=None,
+        kind=kind,
+        recipient_key=RECIPIENT,
+        to=SENDER_PHONE,
+        text=TEXT,
+        idempotency_key=key,
+    )
+
+
+async def _outbox(conn: Any) -> list[dict[str, Any]]:
+    rows = await conn.fetch(
+        "SELECT inbox_id, kind, idempotency_key, status, error_code FROM channel_outbox "
+        "ORDER BY created_at"
+    )
+    return [dict(row) for row in rows]
+
+
+class TestIdempotencyKey:
+    async def test_sends_once_however_often_it_is_called(
+        self, db: Database, owner_conn: Any
+    ) -> None:
+        channel = FakeOutbound()
+        assert [await _send(db, channel) for _ in range(3)] == ["accepted"] * 3
+        assert channel.sent == [OutboundMessage(recipient=SENDER_PHONE, body=TEXT)]
+        assert await _outbox(owner_conn) == [
+            {
+                "inbox_id": None,
+                "kind": KIND,
+                "idempotency_key": KEY,
+                "status": "accepted",
+                "error_code": None,
+            }
+        ]
+
+    async def test_distinct_keys_are_distinct_sends(self, db: Database) -> None:
+        channel = FakeOutbound()
+        await _send(db, channel, key="connected:a")
+        await _send(db, channel, key="connected:b")
+        assert len(channel.sent) == 2
+
+    async def test_the_key_is_global_across_kinds(self, db: Database) -> None:
+        """A key names one event. Reusing it under another kind is the same send."""
+        channel = FakeOutbound()
+        await _send(db, channel, kind="onboarding:all_set")
+        await _send(db, channel, kind="reminder")
+        assert len(channel.sent) == 1
+
+    async def test_transient_then_success_sends_once(self, db: Database, owner_conn: Any) -> None:
+        channel = FakeOutbound(TransientChannelError("429"))
+        with pytest.raises(TransientChannelError):
+            await _send(db, channel)
+        assert (await _outbox(owner_conn))[0]["status"] == "pending"
+
+        assert await _send(db, channel) == "accepted"
+        assert len(channel.attempts) == 2
+        assert len(channel.sent) == 1
+
+    async def test_an_ambiguous_send_is_never_retried(self, db: Database) -> None:
+        channel = FakeOutbound(AmbiguousDeliveryError("read timeout"))
+        assert await _send(db, channel) == "unknown"
+        assert await _send(db, channel) == "unknown"
+        assert len(channel.attempts) == 1
+
+    async def test_a_send_interrupted_mid_flight_is_marked_unknown_not_resent(
+        self, db: Database, owner_conn: Any
+    ) -> None:
+        await owner_conn.execute(
+            "INSERT INTO channel_outbox (channel, kind, recipient_key, idempotency_key, status) "
+            "VALUES ('whatsapp', $1, $2, $3, 'sending')",
+            KIND,
+            RECIPIENT,
+            KEY,
+        )
+        channel = FakeOutbound()
+        assert await _send(db, channel) == "unknown"
+        assert channel.attempts == []
+
+    async def test_a_rejected_send_is_recorded_and_not_retried(
+        self, db: Database, owner_conn: Any
+    ) -> None:
+        channel = FakeOutbound(RejectedChannelError(131047))
+        assert await _send(db, channel) == "failed"
+        assert await _send(db, channel) == "failed"
+        assert len(channel.attempts) == 1
+        assert (await _outbox(owner_conn))[0]["error_code"] == 131047
+
+    async def test_keyed_and_inbox_sends_do_not_collide(
+        self, db: Database, owner_conn: Any
+    ) -> None:
+        inbox_id: UUID = await insert_inbox(owner_conn)
+        channel = FakeOutbound()
+        await send_once(
+            db,
+            channel,
+            inbox_id=inbox_id,
+            kind=KIND,
+            recipient_key=RECIPIENT,
+            to=SENDER_PHONE,
+            text=TEXT,
+        )
+        await _send(db, channel)
+        assert len(channel.sent) == 2
+        assert {row["idempotency_key"] for row in await _outbox(owner_conn)} == {None, KEY}
+
+    async def test_the_outbox_holds_no_text(self, db: Database, owner_conn: Any) -> None:
+        await _send(db, FakeOutbound())
+        rows = await owner_conn.fetch("SELECT row_to_json(o)::text AS j FROM channel_outbox o")
+        assert rows
+        assert all("all set" not in row["j"] for row in rows)
+
+
+class TestArguments:
+    @pytest.mark.parametrize("both", [True, False])
+    async def test_exactly_one_of_inbox_id_and_key(
+        self, db: Database, owner_conn: Any, both: bool
+    ) -> None:
+        inbox_id = await insert_inbox(owner_conn) if both else None
+        with pytest.raises(ValueError, match="exactly one"):
+            await send_once(
+                db,
+                FakeOutbound(),
+                inbox_id=inbox_id,
+                kind=KIND,
+                recipient_key=RECIPIENT,
+                to=SENDER_PHONE,
+                text=TEXT,
+                idempotency_key=KEY if both else None,
+            )
+        assert await _outbox(owner_conn) == []

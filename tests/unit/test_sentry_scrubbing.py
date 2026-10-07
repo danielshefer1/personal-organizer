@@ -145,6 +145,37 @@ class TestScrubEvent:
         scrubbed: Any = scrub_event({"extra": deep}, {})
         assert "<redacted:depth>" in _flatten(scrubbed)
 
+    def test_connect_tokens_are_removed_from_request_urls(self) -> None:
+        """D4: the link token is in the URL's path, the callback's state in its query."""
+        token = "abc.def.ghi"
+        event: Any = {
+            "transaction": "/connect/{token}",
+            "request": {
+                "url": f"https://po.test/connect/{token}",
+                "query_string": f"state={token}&connected_account_id=ca_1",
+            },
+        }
+        scrubbed: Any = scrub_event(event, {})
+        assert all(token not in text for text in _flatten(scrubbed))
+        assert scrubbed["transaction"] == "/connect/{token}"
+        assert scrubbed["request"]["query_string"].endswith("&connected_account_id=ca_1")
+
+    def test_a_state_pair_in_a_list_query_string_is_removed_whatever_its_shape(self) -> None:
+        event: Any = {
+            "request": {"query_string": [["State", "abc"], ["connected_account_id", "ca_1"]]}
+        }
+        scrubbed: Any = scrub_event(event, {})
+        assert scrubbed["request"]["query_string"] == [
+            ["State", "<redacted:state>"],
+            ["connected_account_id", "ca_1"],
+        ]
+
+    def test_an_encoded_state_in_a_header_is_removed(self) -> None:
+        referer = "https://x/cb?next=%2Fcb%3Fstate%3DeyJ0IjoiMSJ9.asYPQA.u24jXyZ-signature"
+        event: Any = {"request": {"headers": {"Referer": referer}}}
+        scrubbed: Any = scrub_event(event, {})
+        assert all("asYPQA" not in text for text in _flatten(scrubbed))
+
 
 class TestScrubBreadcrumb:
     @pytest.mark.parametrize("secret", PATTERN_PII)

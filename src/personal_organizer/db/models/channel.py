@@ -21,7 +21,7 @@ from sqlalchemy import CheckConstraint, ForeignKey, Index, Text, UniqueConstrain
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from personal_organizer.db.base import Base
+from personal_organizer.db.base import Base, check_in
 
 #: Outbox states in the only order they may move through. Delivery updates arrive out of
 #: order and are redelivered, so a status write only ever moves *forward* in this list --
@@ -37,13 +37,12 @@ OUTBOX_STATUS_ORDER: Final = (
     "failed",
 )
 
-DISPOSITIONS: Final = ("allowed", "stranger", "stranger_muted", "stale")
+#: What the worker decided about an inbound row. ``onboarding`` (Iteration 03) is a message
+#: from a tenant still onboarding, answered by its current step; ``allowed`` is one from an
+#: active tenant, handed to ``on_allowed``.
+DISPOSITIONS: Final = ("allowed", "stranger", "stranger_muted", "stale", "onboarding")
 
 _GEN_UUID = text("gen_random_uuid()")
-
-
-def _in(column: str, values: tuple[str, ...]) -> str:
-    return f"{column} IN ({', '.join(repr(value) for value in values)})"
 
 
 class ChannelInbox(Base):
@@ -53,7 +52,7 @@ class ChannelInbox(Base):
         # even when nothing failed; ON CONFLICT on this constraint is what makes that safe.
         UniqueConstraint("channel", "provider_message_id"),
         CheckConstraint("sender_user_id IS NOT NULL OR sender_phone IS NOT NULL", name="sender"),
-        CheckConstraint(_in("disposition", DISPOSITIONS), name="disposition"),
+        CheckConstraint(check_in("disposition", DISPOSITIONS), name="disposition"),
         Index(None, "sender_key"),
     )
 
@@ -89,7 +88,11 @@ class ChannelOutbox(Base):
         UniqueConstraint("inbox_id", "kind"),
         # NULLs are distinct in a unique constraint, so rows not yet accepted do not collide.
         UniqueConstraint("channel", "provider_message_id"),
-        CheckConstraint(_in("status", OUTBOX_STATUS_ORDER), name="status"),
+        # The claim key for a send that answers no inbound row (D6): "You're all set" is
+        # ``connected:<connection_id>``. NULLs are distinct, so rows claimed on
+        # ``(inbox_id, kind)`` -- every reply -- never collide here.
+        UniqueConstraint("idempotency_key"),
+        CheckConstraint(check_in("status", OUTBOX_STATUS_ORDER), name="status"),
         Index(None, "recipient_key", "kind", "created_at"),
     )
 
@@ -104,6 +107,8 @@ class ChannelOutbox(Base):
     #: ``SenderRef.key`` of the recipient -- what the invite-only rate limit looks up.
     recipient_key: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text, server_default=text("'pending'"))
+    #: Set instead of ``inbox_id`` for a send that answers nothing. See ``messaging.outbox``.
+    idempotency_key: Mapped[str | None] = mapped_column(Text)
     provider_message_id: Mapped[str | None] = mapped_column(Text)
     #: The provider's numeric error code. Never its error message, which can echo content.
     error_code: Mapped[int | None]

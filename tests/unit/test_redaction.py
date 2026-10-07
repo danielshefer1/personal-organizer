@@ -6,18 +6,22 @@ This is the mechanised form of Iteration 01's "logs contain no raw PII".
 from __future__ import annotations
 
 import json
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
 import pytest
 
+from personal_organizer.observability import redaction
 from personal_organizer.observability.redaction import (
     CONTENT_KEYS,
     FORBIDDEN_KEYS,
+    MAX_SCAN,
     MAX_STR,
     OPAQUE_ID_KEYS,
     SAFE_KEYS,
     SECRET_KEYS,
+    TRUNCATED,
     Unredacted,
     hash_identifier,
     redact_event,
@@ -183,3 +187,190 @@ class TestUnredactedEscapeHatch:
 
     def test_honoured_when_explicitly_allowed(self) -> None:
         assert "+31612345678" in _render({"note": Unredacted("+31612345678")}, allow_raw=True)
+
+
+class TestConnectUrls:
+    """Onboarding links carry a bearer token in their path, and Composio's callback our signed
+    state in its query. Both go by position, whatever the token's length or shape."""
+
+    @pytest.mark.parametrize(
+        "token",
+        ["abc.def.ghi", "eyJ0IjoiMSJ9.ZxY1aQ.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU"],
+    )
+    def test_a_link_token_is_removed(self, token: str) -> None:
+        assert (
+            scrub_text(f"GET https://po.test/connect/{token} 410")
+            == "GET https://po.test/connect/<redacted:link> 410"
+        )
+
+    def test_the_state_is_removed_and_the_account_id_kept(self) -> None:
+        assert (
+            scrub_text("/connect/callback?state=abc.def.ghi&connected_account_id=ca_1")
+            == "/connect/callback?state=<redacted:state>&connected_account_id=ca_1"
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "/connect/{token}",
+            "/connect/callback",
+            "/webhooks/gowa",
+            "disconnect/now",
+            "https://x/connect%2Fcallback%3Fok%3D1",
+            "https://x/cb?next=%2Fcb%3Festate%3D1",
+            "estate=1",
+            "/CONNECT/Callback",
+        ],
+    )
+    def test_route_templates_and_other_paths_survive(self, value: str) -> None:
+        assert scrub_text(value) == value
+
+    def test_a_logged_path_is_scrubbed(self) -> None:
+        rendered = _render({"event": "request.invalid", "path": "/connect/abc.def.ghi"})
+        assert "abc.def.ghi" not in rendered
+
+    def test_a_connection_id_survives_for_correlation(self) -> None:
+        connection_id = str(uuid4())
+        assert connection_id in _render(
+            {"event": "connect.connected", "connection_id": connection_id}
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "https://x/cb?next=%2Fcb%3Fstate%3D{t}",
+            "https://x/cb?next=%2Fcb%3Fstate%3D{t}%26connected_account_id%3Dca_1",
+            "Referer: https://po.test/connect/callback?State={t}&a=1",
+            "STATE%3d{t}",
+            "https://po.test/Connect/{t}",
+            "https://x/cb?next=%2Fconnect%2F{t}%3Fa%3D1",
+            "https://x/cb?next=%2FCONNECT%2F{t}",
+        ],
+    )
+    def test_encoded_and_mixed_case_forms_are_removed(self, value: str) -> None:
+        token = "eyJ0IjoiMSJ9.asYPQA.u24jXyZ-signature_value"
+        scrubbed = scrub_text(value.format(t=token))
+        for part in token.split("."):
+            assert part not in scrubbed
+
+    def test_an_encoded_account_id_is_kept(self) -> None:
+        scrubbed = scrub_text("x%2Fcb%3Fstate%3Dabc%26connected_account_id%3Dca_1")
+        assert scrubbed.endswith("%26connected_account_id%3Dca_1")
+
+
+#: Inputs shaped to make a backtracking regex try every start against every end. Outsiders
+#: reach scrub_text through X-Request-ID and the path of an unmatched route.
+ADVERSARIAL: dict[str, str] = {
+    "word_run": "a" * 100_000,
+    "call_prefix_run": "x[1](" * 20_000,
+    "dotted_run": "a." * 50_000,
+    "dashed_run": "a-" * 50_000,
+    "mixed_run": "AB12" * 25_000,
+    "email_prefix_run": "a.b%" * 25_000,
+}
+#: "Well under a second". The fixed code takes a few milliseconds; the old, quadratic, 28 s.
+BUDGET_S = 0.25
+
+
+def _timed(fn: Any, value: str) -> float:
+    started = perf_counter()
+    fn(value)
+    return perf_counter() - started
+
+
+class TestBoundedCost:
+    """scrub_text runs on the event loop for every log line and every Sentry event."""
+
+    @pytest.mark.parametrize("name", sorted(ADVERSARIAL))
+    def test_adversarial_input_is_scrubbed_quickly(self, name: str) -> None:
+        assert _timed(scrub_text, ADVERSARIAL[name]) < BUDGET_S
+
+    @pytest.mark.parametrize("name", sorted(ADVERSARIAL))
+    def test_the_call_string_rule_is_linear_by_itself(self, name: str) -> None:
+        """The cap below bounds every rule, but the call-string rule must not need it."""
+        assert _timed(redaction._drop_call_args, ADVERSARIAL[name] * 4) < BUDGET_S
+
+    def test_input_past_the_scan_window_is_dropped_and_marked(self) -> None:
+        scrubbed = scrub_text("ok " * 10 + "x" * (MAX_SCAN * 10))
+        assert scrubbed == ("ok " * 10).rstrip() + TRUNCATED
+
+    def test_a_value_cut_at_the_window_leaves_no_partial_identifier(self) -> None:
+        """Cutting can split a phone number into a run too short for the phone rule. The
+        args rule then shrinks the text, so the piece would land inside MAX_STR."""
+        value = "j:t[1](" + "x" * (MAX_SCAN - 30) + ") phone +31612345678 tail"
+        assert len(value) > MAX_SCAN
+        scrubbed = scrub_text(value)
+        assert "3161" not in scrubbed
+        assert scrubbed.endswith("...<truncated>")
+
+    def test_a_space_formatted_phone_cut_at_the_window_leaves_no_digits(self) -> None:
+        """The word drop leaves "+31 6 1234 " when the cut falls inside the last group: seven
+        digits, below the phone rule's threshold. Trailing number characters go too."""
+        head = "j:t[1](" + "x" * 10
+        tail = ") phone +31 6 1234 "
+        pad = "y" * (MAX_SCAN - 2 - len(head) - len(tail))
+        value = head + pad + tail + "5678 more text"
+        assert value[MAX_SCAN - 2 : MAX_SCAN] == "56"  # the cut splits the last group
+        scrubbed = scrub_text(value)
+        assert "1234" not in scrubbed
+        assert "+31" not in scrubbed
+        assert scrubbed.endswith(TRUNCATED)
+
+    def test_short_values_carry_no_marker(self) -> None:
+        assert scrub_text("all good") == "all good"
+
+    def test_a_value_with_no_whitespace_past_the_window_keeps_only_the_marker(self) -> None:
+        assert scrub_text("a" * (MAX_SCAN + 1)) == TRUNCATED
+
+
+class TestCallStrings:
+    """Procrastinate logs Job.call_string, task kwargs included (docs/adr/0001)."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (
+                "Job channel:handle_inbound[123](inbox_id='9b1d') ended",
+                "Job channel:handle_inbound[123](<redacted:args>) ended",
+            ),
+            (
+                "onboarding:connected[7](tenant_id='a', connection_id='b')",
+                "onboarding:connected[7](<redacted:args>)",
+            ),
+            (
+                "Starting job webhooks.handle-x[9](body='Oncology') now",
+                "Starting job webhooks.handle-x[9](<redacted:args>) now",
+            ),
+            ("a[1](x) and b:c[22](y=1)", "a[1](<redacted:args>) and b:c[22](<redacted:args>)"),
+        ],
+    )
+    def test_the_arguments_are_dropped(self, value: str, expected: str) -> None:
+        assert scrub_text(value) == expected
+
+    def test_arguments_running_past_the_window_are_dropped(self) -> None:
+        """The window ends inside the arguments, so no ``)`` follows the head in it."""
+        value = (
+            "Job channel:handle_inbound[7](text='Dear doctor, my name is Dana Levi and my "
+            "diagnosis is " + "secret " * 400 + "') ended with status: succeeded"
+        )
+        assert len(value) > MAX_SCAN
+        scrubbed = scrub_text(value)
+        assert scrubbed == "Job channel:handle_inbound[7](<redacted:args>)" + TRUNCATED
+
+    @pytest.mark.parametrize("offset", [-3, -2, -1, 0, 1])
+    def test_arguments_straddling_the_cut_are_dropped(self, offset: int) -> None:
+        """The ``)`` just inside the window (where the word drop may take it), on the cut, or
+        just past it: whichever, no argument text survives."""
+        start = "Job channel:handle_inbound[7](text='Dana Levi "
+        args = (start + "secret " * MAX_SCAN)[: MAX_SCAN + offset]
+        value = args + ")" + " after" * 400
+        scrubbed = scrub_text(value)
+        assert scrubbed.startswith("Job channel:handle_inbound[7](<redacted:args>)")
+        assert "Dana" not in scrubbed
+        assert "secret" not in scrubbed
+
+    def test_an_unclosed_call_string_drops_the_rest(self) -> None:
+        assert scrub_text("Job a:b[1](text='Dana Levi") == "Job a:b[1](<redacted:args>)"
+
+    def test_text_without_a_call_string_survives(self) -> None:
+        assert scrub_text("list[1] (not a call)") == "list[1] (not a call)"

@@ -2,8 +2,11 @@
 
 WhatsApp's Cloud API has no idempotency key, and a job can run more than once: Procrastinate
 retries a transient failure, and a job interrupted by a deploy is retried from the top. So
-each reply is claimed in ``channel_outbox`` before it is sent, keyed on
-``(inbox_id, kind)``, and moves through::
+each send is claimed in ``channel_outbox`` before it is sent. A reply to an inbound message
+is keyed on ``(inbox_id, kind)``. A send that answers nothing ("You're all set", reminders
+later) is keyed on an ``idempotency_key`` that names the event, e.g.
+``connected:<connection_id>`` (D6). The key is unique across kinds and must never contain
+message content. Either way the row moves through::
 
     pending -> sending -> accepted            (Meta took it; its statuses follow)
                        -> failed              (Meta refused; not retried)
@@ -22,7 +25,7 @@ from typing import Final
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from personal_organizer.core.errors import (
@@ -50,25 +53,39 @@ async def _set(db: Database, outbox_id: UUID, **values: object) -> None:
 
 
 async def _claim(
-    db: Database, *, channel: str, inbox_id: UUID, kind: str, recipient_key: str
+    db: Database,
+    *,
+    channel: str,
+    inbox_id: UUID | None,
+    kind: str,
+    recipient_key: str,
+    idempotency_key: str | None,
 ) -> tuple[UUID, str]:
-    """Create or lock this reply's row and move it to ``sending`` if it is ours to send.
+    """Create or lock this send's row and move it to ``sending`` if it is ours to send.
 
     Returns the row id and the status the caller should act on: ``sending`` means send now;
     anything in :data:`SETTLED` means a previous attempt already decided the outcome.
     """
+    if idempotency_key is not None:
+        conflict = ["idempotency_key"]
+        this_send = ChannelOutbox.idempotency_key == idempotency_key
+    else:
+        conflict = ["inbox_id", "kind"]
+        this_send = and_(ChannelOutbox.inbox_id == inbox_id, ChannelOutbox.kind == kind)
     async with db.system_session() as session:
         await session.execute(
             insert(ChannelOutbox)
-            .values(channel=channel, inbox_id=inbox_id, kind=kind, recipient_key=recipient_key)
-            .on_conflict_do_nothing(index_elements=["inbox_id", "kind"])
+            .values(
+                channel=channel,
+                inbox_id=inbox_id,
+                kind=kind,
+                recipient_key=recipient_key,
+                idempotency_key=idempotency_key,
+            )
+            .on_conflict_do_nothing(index_elements=conflict)
         )
         row = (
-            await session.execute(
-                select(ChannelOutbox)
-                .where(ChannelOutbox.inbox_id == inbox_id, ChannelOutbox.kind == kind)
-                .with_for_update()
-            )
+            await session.execute(select(ChannelOutbox).where(this_send).with_for_update())
         ).scalar_one()
         if row.status == "sending":
             # The previous attempt died between claiming and recording the outcome.
@@ -84,19 +101,29 @@ async def send_once(
     db: Database,
     channel: OutboundChannel,
     *,
-    inbox_id: UUID,
+    inbox_id: UUID | None,
     kind: str,
     recipient_key: str,
     to: str,
     text: str,
+    idempotency_key: str | None = None,
 ) -> str:
-    """Send ``text`` to ``to`` as the ``kind`` reply to ``inbox_id``, at most once.
+    """Send ``text`` to ``to`` at most once: as the ``kind`` reply to ``inbox_id``, or as the
+    send named by ``idempotency_key``. Exactly one of the two is given.
 
-    Returns the reply's resulting status. Re-raises :class:`TransientChannelError` -- and only
+    Returns the send's resulting status. Re-raises :class:`TransientChannelError` -- and only
     that -- after putting the row back to ``pending``, so the job's retry sends it again.
     """
+    if (inbox_id is None) == (idempotency_key is None):
+        msg = "send_once needs exactly one of inbox_id and idempotency_key"
+        raise ValueError(msg)
     outbox_id, status = await _claim(
-        db, channel=channel.name, inbox_id=inbox_id, kind=kind, recipient_key=recipient_key
+        db,
+        channel=channel.name,
+        inbox_id=inbox_id,
+        kind=kind,
+        recipient_key=recipient_key,
+        idempotency_key=idempotency_key,
     )
     if status != "sending":
         return status

@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block body %}
+{% for section in sections %}
+<section lang="{{ section.lang }}" dir="{{ section.direction }}">
+<h1>{{ section.title }}</h1>
+<p>{{ section.body }}</p>
+</section>
+{% endfor %}
+{% endblock %}

@@ -16,6 +16,7 @@ import procrastinate
 from fastapi import Depends, Request
 
 from personal_organizer.db.engine import Database
+from personal_organizer.interfaces.calendar import ConnectLinker
 from personal_organizer.interfaces.channel import InboundChannel
 from personal_organizer.messaging.ingress import IngressStore
 from personal_organizer.settings import Settings
@@ -41,6 +42,12 @@ def get_ingress_store(request: Request) -> IngressStore:
     return store
 
 
+def get_connect_linker(request: Request) -> ConnectLinker:
+    """Composio, built by the lifespan when ``COMPOSIO__ENABLED``. Tests set a fake."""
+    linker: ConnectLinker = request.app.state.connect_linker
+    return linker
+
+
 def inbound_channel(name: str) -> Callable[[Request], InboundChannel]:
     """A dependency resolving the inbound channel ``name``, as mounted by ``create_app``.
 
@@ -58,13 +65,16 @@ DbDep = Annotated[Database, Depends(get_db)]
 ProcrastinateDep = Annotated[procrastinate.App, Depends(get_procrastinate)]
 SettingsDep = Annotated[Settings, Depends(get_app_settings)]
 IngressStoreDep = Annotated[IngressStore, Depends(get_ingress_store)]
+ConnectLinkerDep = Annotated[ConnectLinker, Depends(get_connect_linker)]
 
 __all__ = [
+    "ConnectLinkerDep",
     "DbDep",
     "IngressStoreDep",
     "ProcrastinateDep",
     "SettingsDep",
     "get_app_settings",
+    "get_connect_linker",
     "get_db",
     "get_ingress_store",
     "get_procrastinate",

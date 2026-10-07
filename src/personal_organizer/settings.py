@@ -26,7 +26,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from personal_organizer.core.errors import MissingDatabaseRoleError
 from personal_organizer.core.phone import normalise_e164
-from personal_organizer.db.roles import DatabaseRole
+from personal_organizer.db.roles import DEFINER_ROLE_NAME, DatabaseRole
 
 Environment = Literal["local", "ci", "staging", "production"]
 Component = Literal["api", "worker", "cli"]
@@ -312,6 +312,11 @@ AUTH_CONFIG_PREFIX: Final = "ac_"
 class ComposioSettings(BaseModel):
     """Composio, which holds users' Google tokens so that we never do (v7 Section 3).
 
+    The tokens are issued to *our own* Google OAuth app: published "In production" and
+    unverified, which shows users Google's warning screen and caps the app at 100 users,
+    plugged into a Composio custom auth config. There is no cutover to come;
+    docs/runbook-iteration-03.md sets both up.
+
     Off by default and all-or-nothing when on, like WhatsApp. Enabled, the api serves the
     connect pages and Composio's callback, so it also needs ``APP__PUBLIC_BASE_URL`` and
     ``ONBOARDING__LINK_SECRET`` -- which live in other sections, so ``Settings`` checks all
@@ -320,9 +325,9 @@ class ComposioSettings(BaseModel):
 
     enabled: bool = False
     api_key: SecretStr | None = None
-    #: The auth config *new* connections are made under: Composio's managed Google Calendar
-    #: config until the Section 3.3 cutover, ours after it. Every connection row records the
-    #: config that made it, so changing this never breaks an existing connection.
+    #: The auth config new connections are made under: our custom Google Calendar config,
+    #: one per Composio project. Every connection row records the config that made it, so
+    #: changing this never breaks an existing connection.
     calendar_auth_config_id: str | None = None
     request_timeout_s: float = 15.0
 
@@ -392,7 +397,17 @@ class Settings(BaseSettings):
         return self.app.env in ("staging", "production")
 
     def dsn_for(self, role: DatabaseRole) -> str:
-        """Return the DSN for ``role``, or raise if it was never configured."""
+        """Return the DSN for ``role``, or raise if it was never configured.
+
+        ``DEFINER`` is refused outright rather than looked up: ``app_definer`` is ``NOLOGIN``,
+        so no DSN for it can work, and a ``DATABASE__DEFINER_URL`` someone adds would be a
+        BYPASSRLS login waiting to be enabled.
+        """
+        if role is DatabaseRole.DEFINER:
+            raise MissingDatabaseRoleError(
+                role.value,
+                reason=f"{DEFINER_ROLE_NAME} is NOLOGIN; it owns functions, nothing connects",
+            )
         value: SecretStr | None = getattr(self.database, f"{role.value}_url", None)
         if value is None:
             raise MissingDatabaseRoleError(role.value)

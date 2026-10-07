@@ -28,6 +28,13 @@ class TestParsing:
         with pytest.raises(MissingDatabaseRoleError):
             cfg.dsn_for(DatabaseRole.BOOTSTRAP)
 
+    def test_the_definer_role_has_no_dsn(self, settings_factory: Any) -> None:
+        """app_definer is NOLOGIN and BYPASSRLS: a DSN for it must never be honoured, even
+        one someone configured."""
+        cfg = settings_factory(DATABASE__DEFINER_URL="postgresql://app_definer:pw@h/db")
+        with pytest.raises(MissingDatabaseRoleError, match="NOLOGIN"):
+            cfg.dsn_for(DatabaseRole.DEFINER)
+
 
 class TestSecretsNeverRender:
     """An exception traceback that renders the settings object is a classic leak."""

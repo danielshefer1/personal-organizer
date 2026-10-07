@@ -49,6 +49,15 @@ def _scrub_keyed(key: Any, value: Any, depth: int) -> Any:
     return _scrub(value, depth + 1)
 
 
+_STATE_MARKER = "<redacted:state>"
+
+
+def _is_state_pair(value: Sequence[Any]) -> bool:
+    """A ``["state", token]`` pair, as Sentry lists a query string. The name decides, not the
+    value's shape: the signed state is the one parameter that must never leave."""
+    return len(value) == 2 and isinstance(value[0], str) and value[0].casefold() == "state"
+
+
 def _scrub(value: Any, depth: int = 0) -> Any:
     if depth >= _MAX_DEPTH:
         return "<redacted:depth>"
@@ -57,6 +66,8 @@ def _scrub(value: Any, depth: int = 0) -> Any:
     if isinstance(value, Mapping):
         return {key: _scrub_keyed(key, item, depth) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        if _is_state_pair(value):
+            return [value[0], _STATE_MARKER]
         return [_scrub(item, depth + 1) for item in value]
     return value
 

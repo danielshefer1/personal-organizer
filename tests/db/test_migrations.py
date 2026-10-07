@@ -107,3 +107,65 @@ async def test_procrastinate_tables_are_owned_by_the_owner_role(app_conn: Any) -
         "WHERE c.relname = 'procrastinate_jobs'"
     )
     assert owner == "app_owner"
+
+
+#: What 0004 adds, by catalog: tables, definer functions, and the outbox column.
+_TENANT_TABLES = [
+    "calendar_connections",
+    "messages",
+    "onboarding_links",
+    "tenant_identities",
+    "tenants",
+]
+_TENANT_TABLES_SQL = (
+    "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
+    "AND tablename = ANY($1::text[]) ORDER BY tablename"
+)
+_DEFINER_FUNCTIONS_SQL = (
+    "SELECT p.proname, r.rolname FROM pg_proc p JOIN pg_roles r ON p.proowner = r.oid "
+    "WHERE p.proname IN ('resolve_tenant', 'create_tenant') ORDER BY p.proname"
+)
+_OUTBOX_KEY_SQL = (
+    "SELECT count(*) FROM information_schema.columns "
+    "WHERE table_name = 'channel_outbox' AND column_name = 'idempotency_key'"
+)
+
+
+async def test_the_tenants_downgrade_round_trips(owner_conn: Any) -> None:
+    """0004 down and up again, with an ``onboarding`` row in the inbox to carry across.
+
+    The row is the case a plain drop-and-recreate misses: 0003's disposition check does not
+    know ``onboarding``, so restoring that check over such a row fails the downgrade.
+    """
+    config = _config()
+    await owner_conn.execute("TRUNCATE channel_outbox, channel_inbox CASCADE")
+    inbox_id = await owner_conn.fetchval(
+        "INSERT INTO channel_inbox (channel, provider_message_id, sender_key, sender_phone, "
+        "message_type, sent_at, disposition) "
+        "VALUES ('gowa', 'round-trip', 'tel:+15550000000', '+15550000000', 'text', now(), "
+        "'onboarding') RETURNING id"
+    )
+    try:
+        command.downgrade(config, "0003_channel_ledgers")
+        assert await owner_conn.fetch(_TENANT_TABLES_SQL, _TENANT_TABLES) == []
+        assert await owner_conn.fetch(_DEFINER_FUNCTIONS_SQL) == []
+        assert await owner_conn.fetchval(_OUTBOX_KEY_SQL) == 0
+        assert (
+            await owner_conn.fetchval(
+                "SELECT disposition FROM channel_inbox WHERE id = $1", inbox_id
+            )
+            == "allowed"
+        )
+
+        command.upgrade(config, "head")
+        tables = await owner_conn.fetch(_TENANT_TABLES_SQL, _TENANT_TABLES)
+        assert [row["tablename"] for row in tables] == _TENANT_TABLES
+        functions = await owner_conn.fetch(_DEFINER_FUNCTIONS_SQL)
+        assert [(row["proname"], row["rolname"]) for row in functions] == [
+            ("create_tenant", "app_definer"),
+            ("resolve_tenant", "app_definer"),
+        ]
+        assert await owner_conn.fetchval(_OUTBOX_KEY_SQL) == 1
+    finally:
+        command.upgrade(config, "head")
+        await owner_conn.execute("TRUNCATE channel_outbox, channel_inbox CASCADE")

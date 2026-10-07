@@ -36,6 +36,7 @@ DECLARE
     owner_pw   text := current_setting('po.owner_password');
     app_role   text := current_setting('po.app_role');
     app_pw     text := current_setting('po.app_password');
+    definer    text := current_setting('po.definer_role');
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = owner_role) THEN
         EXECUTE format(
@@ -60,6 +61,28 @@ BEGIN
     EXECUTE format('GRANT USAGE ON SCHEMA public TO %I', app_role);
     -- Deliberately NOT granted: app_owner to app_user. That would be a SET ROLE escape
     -- hatch straight out of RLS.
+
+    -- 3b. The SECURITY DEFINER owner (Iteration 03, D1). It owns resolve_tenant and
+    -- create_tenant, which map a sender to a tenant before any tenant GUC can be set, so
+    -- it reads tenant_identities past RLS: BYPASSRLS, which only a superuser can grant --
+    -- hence here and not in a migration. NOLOGIN, so nothing can connect as it. The ALTER
+    -- re-asserts every attribute on re-runs, so a role someone loosened by hand is put back.
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = definer) THEN
+        EXECUTE format(
+            'CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS', definer
+        );
+    END IF;
+    EXECUTE format(
+        'ALTER ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS', definer
+    );
+    -- PostgreSQL 16's rule for ALTER FUNCTION ... OWNER TO, which migration 0004 runs as
+    -- app_owner: the caller must be able to SET ROLE to the new owner, and the new owner
+    -- must hold CREATE on the function's schema. Both grants exist for that and nothing
+    -- else. app_owner already owns every tenant table, so becoming app_definer gains it
+    -- nothing it could not do by disabling RLS on its own tables.
+    EXECUTE format('GRANT USAGE, CREATE ON SCHEMA public TO %I', definer);
+    EXECUTE format('GRANT %I TO %I', definer, owner_role);
+    -- Deliberately NOT granted: app_definer to app_user. That would be BYPASSRLS on demand.
 
     -- 4. Default privileges. This is what stops the owner/app split becoming a permanent
     -- GRANT tax on every migration: objects app_owner creates from here on are

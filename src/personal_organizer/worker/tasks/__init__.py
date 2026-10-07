@@ -10,8 +10,12 @@ from collections.abc import Callable
 
 import procrastinate
 
-from personal_organizer.worker.tasks import channel, system
+from personal_organizer.worker.tasks import channel, onboarding, system
 
-REGISTRARS: list[Callable[[procrastinate.App], None]] = [system.register, channel.register]
+REGISTRARS: list[Callable[[procrastinate.App], None]] = [
+    system.register,
+    channel.register,
+    onboarding.register,
+]
 
 __all__ = ["REGISTRARS"]

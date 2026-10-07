@@ -45,13 +45,16 @@ def register(app: procrastinate.App) -> None:
     @app.task(queue=Queue.WEBHOOKS.value, name=HANDLE_INBOUND_TASK, retry=INBOUND_RETRY)
     async def handle_inbound_task(inbox_id: str) -> None:
         db = get_database()
+        settings = get_settings()
         await handle_inbound(
             UUID(inbox_id),
             db=db,
             channels=get_outbound_channel,
             # The invite list, whichever channel the message came in on.
-            allowlist=get_settings().whatsapp.allowlist,
+            allowlist=settings.whatsapp.allowlist,
             on_allowed=functools.partial(acknowledge, db=db),
+            # Composio on: the tenant gate and onboarding. Off: Iteration 02's gate, exactly.
+            settings=settings,
         )
 
 

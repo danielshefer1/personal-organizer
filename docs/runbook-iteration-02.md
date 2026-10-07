@@ -2,9 +2,7 @@
 
 > **Phase B is parked (2026-10-04).** Meta disabled the WhatsApp Business Account on
 > 2026-09-30 pending business verification. Until it is restored, WhatsApp runs through the
-> GOWA gateway instead: `docs/runbook-whatsapp-gateway.md`, and docs/adr/0004. Phase B step 1
-> is also out of date: Meta now creates the app from the "Connect with customers through
-> WhatsApp" use case, not app type "Business" plus an added product.
+> GOWA gateway instead: `docs/runbook-whatsapp-gateway.md`, and docs/adr/0004.
 
 Iteration 02 is done when **replaying the same webhook ten times creates one job, an unsigned
 or wrongly signed POST is rejected, and an unregistered sender uses no LLM budget**. All
@@ -78,13 +76,16 @@ prints the `sender_hash` your lines are logged under.
 
 ## Phase B — staging, live
 
-1. **Create the app.** developers.facebook.com → My Apps → Create app → type **Business** →
-   add the **WhatsApp** product. Meta creates a test WhatsApp Business Account with a free
-   **test number**.
-2. **API Setup** (WhatsApp → API Setup):
+1. **Create the app.** developers.facebook.com → My Apps → Create app → choose the use case
+   **Connect with customers through WhatsApp**, then the business portfolio. Meta creates a
+   test WhatsApp Business Account with a free **test number**. There is no longer an app
+   type to pick or a product to add.
+2. **API Setup** (WhatsApp → API Setup, also reached from the use case's **Customize**):
    - note the **Phone number ID** of the test number
    - under *To*, add your own phone as a **recipient** and confirm the code WhatsApp sends.
-     The test number can only message recipients listed here (up to five).
+     The test number can only message recipients listed here (up to five). Nothing goes in
+     App Roles → Test Users: that list is for people who log in to the app, not for whom it
+     messages.
 3. **A token that does not expire.** The token on the API Setup page lasts about 24 hours.
    For staging, Business settings → Users → **System users** → add one (Admin) → assign it
    the app and the WhatsApp account → **Generate token** with `whatsapp_business_messaging`

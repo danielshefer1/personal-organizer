@@ -10,7 +10,8 @@ from personal_organizer.core.errors import (
 from personal_organizer.settings import Settings
 from personal_organizer.worker.app import build_procrastinate_app
 from personal_organizer.worker.queues import Queue
-from personal_organizer.worker.tasks.channel import HANDLE_INBOUND_TASK
+from personal_organizer.worker.tasks.channel import HANDLE_INBOUND_TASK, INBOUND_RETRY
+from personal_organizer.worker.tasks.onboarding import ONBOARDING_CONNECTED_TASK
 from personal_organizer.worker.tasks.system import PING_TASK, RETRY_STALLED_TASK
 
 
@@ -88,3 +89,16 @@ class TestStalledJobRecovery:
     def test_runs_never_pile_up(self, settings: Settings) -> None:
         app = build_procrastinate_app(settings)
         assert app.tasks[RETRY_STALLED_TASK].queueing_lock == RETRY_STALLED_TASK
+
+
+class TestOnboardingTasks:
+    def test_the_connected_task_runs_on_a_queue_the_worker_takes(self, settings: Settings) -> None:
+        """Otherwise the callback says "connected" and the message never comes."""
+        task = build_procrastinate_app(settings).tasks[ONBOARDING_CONNECTED_TASK]
+        assert task.queue == Queue.WEBHOOKS.value
+        assert task.queue in settings.worker.queues
+
+    def test_it_retries_what_the_inbound_task_retries(self, settings: Settings) -> None:
+        """Only definitely-unsent failures: an ambiguous send is never repeated (ADR 0003)."""
+        task = build_procrastinate_app(settings).tasks[ONBOARDING_CONNECTED_TASK]
+        assert task.retry_strategy is INBOUND_RETRY

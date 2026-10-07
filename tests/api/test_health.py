@@ -1,9 +1,20 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+import io
+import re
+from time import perf_counter
+from uuid import uuid4
+
+import pytest
+from fastapi import FastAPI, Request
 from httpx import AsyncClient
+from structlog.testing import capture_logs
 
 from personal_organizer import __version__
+from personal_organizer.api.app import _route_template
+from personal_organizer.api.middleware import UNMATCHED_ROUTE
+from personal_organizer.observability.logging import configure_logging
+from personal_organizer.settings import Settings
 
 
 class TestHealth:
@@ -37,3 +48,85 @@ class TestReady:
         response = await client.get("/ready")
         assert response.status_code == 503
         assert response.json()["status"] == "degraded"
+
+
+class TestRequestContext:
+    """X-Request-ID and the request path are the caller's to choose, and both reach a log line
+    (scrub_text runs on each, on the event loop): only bounded, id-shaped values get there."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "a" * 129,
+            "x[1](" * 13_000,
+            "has space",
+            "+31 6 1234 5678",
+            "<script>",
+            "line\tbreak",
+            "naïve",
+        ],
+        ids=["too_long", "call_string_64k", "space", "phone", "markup", "tab", "non_ascii"],
+    )
+    async def test_an_odd_request_id_is_replaced(self, client: AsyncClient, value: str) -> None:
+        with capture_logs() as logs:
+            # Bytes, as a raw client would send them: httpx refuses a non-ASCII str header.
+            header = value.encode("latin-1")
+            response = await client.get("/health/x", headers={b"x-request-id": header})
+        echoed = response.headers["x-request-id"]
+        assert echoed != value
+        assert re.fullmatch(r"[0-9a-f]{32}", echoed)
+        assert all(value not in str(entry) for entry in logs)
+
+    @pytest.mark.parametrize("value", ["a" * 128, "req-1.2:3_4", str(uuid4())])
+    async def test_an_id_shaped_request_id_is_kept(self, client: AsyncClient, value: str) -> None:
+        response = await client.get("/health", headers={"x-request-id": value})
+        assert response.headers["x-request-id"] == value
+
+    async def test_an_unmatched_path_is_not_logged(self, client: AsyncClient) -> None:
+        path = "/" + "x[1](" * 12_000  # 60 KB: httpx refuses much longer URLs
+        with capture_logs() as logs:
+            response = await client.get(path)
+        assert response.status_code == 404
+        [entry] = [entry for entry in logs if entry["event"] == "http.request"]
+        assert entry["route"] == UNMATCHED_ROUTE
+        assert all("x[1](x[1](" not in str(entry) for entry in logs)
+
+    async def test_a_matched_route_logs_its_template(self, client: AsyncClient) -> None:
+        with capture_logs() as logs:
+            await client.post("/internal/ping")
+        [entry] = [entry for entry in logs if entry["event"] == "http.request"]
+        assert entry["route"] == "/internal/ping"
+
+    async def test_hostile_header_and_path_are_logged_quickly(
+        self, client: AsyncClient, settings: Settings
+    ) -> None:
+        """Through the real processor chain: 64 KB of each took 23 s before the fix. (The
+        path is a little short of 64 KB: httpx refuses longer URLs.)"""
+        configure_logging(settings, stream=io.StringIO())
+        started = perf_counter()
+        await client.get("/" + "a" * 60_000, headers={"x-request-id": "a" * 65_536})
+        assert perf_counter() - started < 1.0
+
+
+class TestInvalidRequests:
+    async def test_an_invalid_request_logs_its_route_not_its_path(
+        self, app: FastAPI, client: AsyncClient
+    ) -> None:
+        """request.invalid used to log the raw path, which the caller chose."""
+
+        @app.get("/items/{item_id}")
+        async def item(item_id: int) -> dict[str, int]:
+            return {"item_id": item_id}
+
+        odd = "Dana%20Levi%20+31612345678" + "x[1](" * 2_000
+        with capture_logs() as logs:
+            response = await client.get(f"/items/{odd}")
+        assert response.status_code == 422
+        [entry] = [entry for entry in logs if entry["event"] == "request.invalid"]
+        assert entry["route"] == "/items/{item_id}"
+        assert "path" not in entry
+        assert all("Dana" not in str(e) and "x[1](x[1](" not in str(e) for e in logs)
+
+    async def test_the_route_is_a_fixed_marker_when_none_matched(self) -> None:
+        request = Request({"type": "http", "method": "GET", "path": "/odd", "headers": []})
+        assert _route_template(request) == UNMATCHED_ROUTE

@@ -23,8 +23,9 @@ class MissingDatabaseRoleError(ConfigError):
 
     code = "missing_database_role"
 
-    def __init__(self, role: str) -> None:
-        super().__init__(f"No DSN configured for database role {role!r}")
+    def __init__(self, role: str, *, reason: str | None = None) -> None:
+        message = f"No DSN configured for database role {role!r}"
+        super().__init__(f"{message}: {reason}" if reason else message)
         self.role = role
 
 
@@ -87,10 +88,39 @@ class MessageTooLongError(ChannelError):
         self.limit = limit
 
 
+class CalendarProviderError(AppError):
+    """The calendar connector (Composio) refused or failed a request.
+
+    Messages are fixed strings. The SDK's own name the user id and echo request URLs, and our
+    callback URL carries a signed state.
+    """
+
+    code = "calendar_provider_error"
+
+
+class CalendarProviderUnavailableError(CalendarProviderError):
+    """Timed out, unreachable, throttled or a 5xx. The same request may work later."""
+
+    code = "calendar_provider_unavailable"
+
+
+class CalendarProviderRejectedError(CalendarProviderError):
+    """Refused: a 4xx, an SDK-side refusal, or a response we cannot use. Retrying won't help."""
+
+    code = "calendar_provider_rejected"
+
+    def __init__(self, status_code: int | None) -> None:
+        super().__init__(f"Calendar provider rejected the request (status {status_code})")
+        self.status_code = status_code
+
+
 __all__ = [
     "AmbiguousDeliveryError",
     "AppError",
     "BootstrapError",
+    "CalendarProviderError",
+    "CalendarProviderRejectedError",
+    "CalendarProviderUnavailableError",
     "ChannelError",
     "ChannelNotConfiguredError",
     "ConfigError",

@@ -1,13 +1,39 @@
-"""Handling one stored inbound message: the access-control gate in front of the agent.
+"""Handling one stored inbound message: the gate in front of the agent.
 
-Iteration 02 has no agent, so an allowlisted sender gets a fixed acknowledgement. What this
-module guarantees is the part that must hold before there *is* one: a sender who is not on
-the allowlist never reaches ``on_allowed`` -- the seam Iteration 04 turns into "defer an agent
-turn" -- and so can never spend an LLM call or a token of budget. They get one fixed line,
-at most once a day, and their message content is deleted.
+Two gates, chosen by configuration. With Composio off, before the Google connect is set up
+on an environment, it is Iteration 02's allowlist gate, unchanged. An invited sender gets the
+fixed acknowledgement. Anyone else gets one invite-only line a day, and their content is
+deleted. With Composio on it is the tenant gate (D2 in docs/plan-iteration-03.md):
 
-Everything is idempotent under a re-run of the job: ``processed_at`` ends a re-run early,
-and replies go through :func:`send_once`.
+====================================  ======================================================
+Sender                                Outcome (disposition)
+====================================  ======================================================
+resolves to an ``active`` tenant      ``on_allowed`` (``allowed``)
+resolves to an ``onboarding`` tenant  the current onboarding step (``onboarding``)
+no tenant, number on the invite list  ``enrol``, then the first step (``onboarding``)
+anything else, suspended included     invite-only reply and purge (``stranger[_muted]``)
+====================================  ======================================================
+
+What both guarantee is the part that must hold before there *is* an agent. A sender who is
+not invited never reaches ``on_allowed``, the seam Iteration 04 turns into "defer an agent
+turn", and so never spends an LLM call. Identity wins over the invite list: an onboarded
+person stays served after their number is removed from it.
+
+**D7.** A known tenant's message is copied into ``messages``, under RLS, and nulled here.
+That happens in the one transaction that finishes the row, together with whatever state the
+onboarding step decided: ``channel_inbox`` is not an RLS table, so the tenant-scoped session
+that writes ``messages`` can update it too, and the step's change, the copy, the nulling and
+``processed_at`` commit or roll back as one. For a job that finishes, nothing a known tenant
+writes outlives it outside RLS. A job that exhausts its retries leaves the body in
+``channel_inbox`` until it is processed (retention is Iteration 12's audit item). Strangers'
+messages are purged as before. So are those of an invited number whose first message came too
+late to answer, since there is no tenant to keep them under. The transaction claims the row
+first (``processed_at IS NULL``), so an overlapping retry writes nothing.
+
+**Re-runs.** ``processed_at`` ends a re-run early and every reply goes through
+:func:`send_once`. A job that dies after its sends and before that transaction re-runs from
+the same stored state (the tenant row, "is there a recorded message yet", the message), so it
+makes the same decision, hits already-claimed sends, and commits the change exactly once.
 
 Replies go out on the channel the message came in on. Several channels can be live at once,
 so the handler is given a resolver and looks up the row's ``channel`` by name. The
@@ -18,8 +44,8 @@ who writes to two of our numbers is told once.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Final
 from uuid import UUID
 
@@ -27,9 +53,15 @@ import structlog
 from sqlalchemy import exists, func, select, update
 
 from personal_organizer.core.errors import ChannelError
+from personal_organizer.core.types import TenantId
 from personal_organizer.db.engine import Database
 from personal_organizer.db.models.channel import ChannelInbox, ChannelOutbox
+from personal_organizer.db.repositories.messages import record_inbound
+from personal_organizer.db.repositories.tenants import set_onboarding_step, set_timezone
 from personal_organizer.interfaces.channel import OutboundChannel
+from personal_organizer.messaging.inbox import InboxRow, load_row
+from personal_organizer.messaging.language import detect_language
+from personal_organizer.messaging.onboarding import Advance, onboarding_step
 from personal_organizer.messaging.outbox import send_once
 from personal_organizer.messaging.replies import (
     ACK_TEXT,
@@ -38,6 +70,8 @@ from personal_organizer.messaging.replies import (
     SERVICE_WINDOW,
     SERVICE_WINDOW_MARGIN,
 )
+from personal_organizer.messaging.tenancy import enrol, load_state, resolve_sender
+from personal_organizer.settings import Settings
 
 log = structlog.get_logger(__name__)
 
@@ -48,36 +82,13 @@ INVITE_ONLY: Final = "invite_only"
 #: pending or that Meta refused does not mute the next one.
 _MUTING_STATUSES: Final = ("sending", "unknown", "accepted", "sent", "delivered", "read")
 
+#: Tenant statuses the gate serves. ``suspended`` (and anything newer) is turned away.
+_SERVED: Final = frozenset({"active", "onboarding"})
 
-@dataclass(frozen=True, slots=True)
-class InboxRow:
-    """A snapshot of the row, read once at the start of the job."""
-
-    id: UUID
-    channel: str
-    provider_message_id: str
-    sender_key: str
-    sender_phone: str | None
-    message_type: str
-    body: str | None
-    sent_at: datetime
-    processed_at: datetime | None
-    disposition: str | None
-
-    @classmethod
-    def of(cls, row: ChannelInbox) -> InboxRow:
-        return cls(
-            id=row.id,
-            channel=row.channel,
-            provider_message_id=row.provider_message_id,
-            sender_key=row.sender_key,
-            sender_phone=row.sender_phone,
-            message_type=row.message_type,
-            body=row.body,
-            sent_at=row.sent_at,
-            processed_at=row.processed_at,
-            disposition=row.disposition,
-        )
+#: What a purge nulls: the message's content, leaving what deduplication and the mute need.
+_PURGED: Final = MappingProxyType(
+    {"body": None, "raw": None, "media_id": None, "media_mime_type": None}
+)
 
 
 #: The handoff for an allowed sender, given the channel to answer on.
@@ -89,12 +100,6 @@ ChannelResolver = Callable[[str], OutboundChannel]
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
-
-
-async def _load(db: Database, inbox_id: UUID) -> InboxRow | None:
-    async with db.system_session() as session:
-        row = await session.get(ChannelInbox, inbox_id)
-        return InboxRow.of(row) if row is not None else None
 
 
 async def _already_told(db: Database, row: InboxRow, now: datetime) -> bool:
@@ -118,14 +123,53 @@ async def _finish(db: Database, row: InboxRow, disposition: str, *, purge: bool)
     values: dict[str, object] = {"processed_at": func.now(), "disposition": disposition}
     if purge:
         # A stranger's words have no reason to be kept, and every reason not to be.
-        values |= {"body": None, "raw": None, "media_id": None, "media_mime_type": None}
+        values |= _PURGED
     async with db.system_session() as session:
         await session.execute(update(ChannelInbox).where(ChannelInbox.id == row.id).values(values))
 
 
+async def _finish_known(
+    db: Database,
+    row: InboxRow,
+    tenant_id: UUID,
+    disposition: str,
+    advance: Advance | None = None,
+) -> None:
+    """D7: copy the content under RLS and null it here, in the transaction that finishes the
+    row, together with the state the onboarding step decided."""
+    change = advance or Advance()
+    async with db.tenant_session(TenantId(tenant_id)) as session:
+        # Claim the row first. ``messages.inbox_id`` is not unique, so an overlapping retry that
+        # loaded the row before this one committed must find it finished and write nothing.
+        finished = await session.scalar(
+            update(ChannelInbox)
+            .where(ChannelInbox.id == row.id, ChannelInbox.processed_at.is_(None))
+            .values(processed_at=func.now(), disposition=disposition, **_PURGED)
+            .returning(ChannelInbox.id)
+        )
+        if finished is None:
+            log.info("inbound.already_processed", inbox_id=str(row.id))
+            return
+        if change.timezone is not None:
+            await set_timezone(session, tenant_id, change.timezone)
+        if change.next_step is not None:
+            await set_onboarding_step(session, tenant_id, change.next_step)
+        await record_inbound(
+            session,
+            tenant_id,
+            inbox_id=row.id,
+            channel=row.channel,
+            message_type=row.message_type,
+            body=row.body,
+            sent_at=row.sent_at,
+        )
+
+
 async def acknowledge(row: InboxRow, channel: OutboundChannel, *, db: Database) -> None:
     """Iteration 02's ``on_allowed``: the fixed acknowledgement. Iteration 04 replaces it."""
-    if row.sender_phone is None:  # pragma: no cover - allowlisting requires a phone
+    if row.sender_phone is None:
+        # An active tenant who writes with a BSUID and no number reaches here (the tenant gate
+        # does not need a phone). Until Iteration 04 there is no reply to such a sender.
         return
     await send_once(
         db,
@@ -158,6 +202,79 @@ async def _turn_away(db: Database, channel: OutboundChannel, row: InboxRow, now:
     return "stranger"
 
 
+async def _mark_read(channel: OutboundChannel, row: InboxRow) -> None:
+    try:
+        await channel.mark_read(row.provider_message_id)
+    except ChannelError as exc:
+        # Blue ticks are cosmetic; failing the job over them would delay the reply.
+        log.warning("inbound.mark_read_failed", inbox_id=str(row.id), error_type=type(exc).__name__)
+
+
+def _is_stale(row: InboxRow, current: datetime) -> bool:
+    # Redelivered after an outage. The reply window has closed, so any send would be
+    # refused -- and replying to a day-old message out of the blue is worse than silence.
+    return current - row.sent_at >= SERVICE_WINDOW - SERVICE_WINDOW_MARGIN
+
+
+async def _allowlist_gate(
+    db: Database,
+    channel: OutboundChannel,
+    row: InboxRow,
+    current: datetime,
+    *,
+    allowlist: frozenset[str],
+    on_allowed: OnAllowed,
+) -> str:
+    """Iteration 02's gate, kept exactly for environments without Composio."""
+    allowed = row.sender_phone is not None and row.sender_phone in allowlist
+    if _is_stale(row, current):
+        disposition = "stale"
+    elif allowed:
+        await _mark_read(channel, row)
+        await on_allowed(row, channel)
+        disposition = "allowed"
+    else:
+        disposition = await _turn_away(db, channel, row, current)
+    await _finish(db, row, disposition, purge=not allowed)
+    return disposition
+
+
+async def _tenant_gate(
+    db: Database,
+    channel: OutboundChannel,
+    row: InboxRow,
+    current: datetime,
+    *,
+    allowlist: frozenset[str],
+    on_allowed: OnAllowed,
+    settings: Settings,
+) -> str:
+    """D2: serve, onboard, enrol or turn away. See the module docstring's table."""
+    stale = _is_stale(row, current)
+    tenant_id = await resolve_sender(db, row)
+    invited = row.sender_phone is not None and row.sender_phone in allowlist
+    if tenant_id is None and invited and not stale:
+        # Their first message. Its words decide the tenant's language (D11).
+        tenant_id = await enrol(db, row, language=detect_language(row.body))
+    tenant = await load_state(db, tenant_id) if tenant_id is not None else None
+
+    if tenant is None or tenant.status not in _SERVED:
+        disposition = "stale" if stale else await _turn_away(db, channel, row, current)
+        await _finish(db, row, disposition, purge=True)
+        return disposition
+    if stale:
+        await _finish_known(db, row, tenant.id, "stale")
+        return "stale"
+    await _mark_read(channel, row)
+    if tenant.status == "active":
+        await on_allowed(row, channel)
+        await _finish_known(db, row, tenant.id, "allowed")
+        return "allowed"
+    advance = await onboarding_step(db, channel, row, tenant, settings=settings, now=current)
+    await _finish_known(db, row, tenant.id, "onboarding", advance)
+    return "onboarding"
+
+
 async def handle_inbound(
     inbox_id: UUID,
     *,
@@ -165,10 +282,15 @@ async def handle_inbound(
     channels: ChannelResolver,
     allowlist: frozenset[str],
     on_allowed: OnAllowed,
+    settings: Settings | None = None,
     now: Callable[[], datetime] = _utcnow,
 ) -> str | None:
-    """Process one inbox row. Returns its disposition, or ``None`` if the row is gone."""
-    row = await _load(db, inbox_id)
+    """Process one inbox row. Returns its disposition, or ``None`` if the row is gone.
+
+    ``settings`` with ``composio.enabled`` selects the tenant gate. ``None``, or Composio
+    off, is Iteration 02's allowlist gate exactly.
+    """
+    row = await load_row(db, inbox_id)
     if row is None:
         log.warning("inbound.missing", inbox_id=str(inbox_id))
         return None
@@ -178,26 +300,21 @@ async def handle_inbound(
     # (switched off with jobs still queued) fails here and stays unprocessed for a re-run.
     channel = channels(row.channel)
 
-    allowed = row.sender_phone is not None and row.sender_phone in allowlist
     current = now()
-    if current - row.sent_at >= SERVICE_WINDOW - SERVICE_WINDOW_MARGIN:
-        # Redelivered after an outage. The reply window has closed, so any send would be
-        # refused -- and replying to a day-old message out of the blue is worse than silence.
-        disposition = "stale"
-    elif allowed:
-        try:
-            await channel.mark_read(row.provider_message_id)
-        except ChannelError as exc:
-            # Blue ticks are cosmetic; failing the job over them would delay the reply.
-            log.warning(
-                "inbound.mark_read_failed", inbox_id=str(row.id), error_type=type(exc).__name__
-            )
-        await on_allowed(row, channel)
-        disposition = "allowed"
+    if settings is not None and settings.composio.enabled:
+        disposition = await _tenant_gate(
+            db,
+            channel,
+            row,
+            current,
+            allowlist=allowlist,
+            on_allowed=on_allowed,
+            settings=settings,
+        )
     else:
-        disposition = await _turn_away(db, channel, row, current)
-
-    await _finish(db, row, disposition, purge=not allowed)
+        disposition = await _allowlist_gate(
+            db, channel, row, current, allowlist=allowlist, on_allowed=on_allowed
+        )
     log.info(
         "inbound.handled",
         inbox_id=str(row.id),

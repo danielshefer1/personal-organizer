@@ -130,7 +130,7 @@ mounts `/connect/*` is deployed to staging.
 | `COMPOSIO__CALENDAR_AUTH_CONFIG_ID` | api (the worker only validates it) | `ac_…` (3.3) | boot fails unless it starts with `ac_`. An id from a different project than the key: `connect.link_provider_rejected`, or on the callback `connect.callback_refused` with `reason: auth_config_mismatch` |
 | `COMPOSIO__REQUEST_TIMEOUT_S` | api | leave unset (`15`) | too small: spurious `connect.*_provider_unavailable` (503 pages) |
 | `APP__PUBLIC_BASE_URL` | api, worker | `https://<staging api domain>`: an origin, no path, no trailing route | boot fails with `must be an origin`, or `must be https:// when deployed`. A domain that is not the api's: links in WhatsApp lead nowhere. The wrong origin at Composio: the callback never reaches the api |
-| `ONBOARDING__LINK_SECRET` | api, worker | at least 32 characters: `uv run python -c "import secrets; print(secrets.token_hex(32))"` | boot fails when missing, shorter than 32, or `.env.example`'s placeholder when deployed. **Different on api and worker**: every link page says the link is invalid and nothing else fails |
+| `ONBOARDING__LINK_SECRET` | api, worker | at least 32 characters: `uv run python -c "import secrets; print(secrets.token_hex(32))"` | boot fails when missing, shorter than 32, or `.env.example`'s placeholder when deployed. **Different on api and worker**: every link, even a fresh one tapped at once, shows "This link has expired" (410, api logs `connect.page_refused`) and nothing else fails |
 | `ONBOARDING__LINK_TTL_S` | api, worker | leave unset (`900`); 60–3600 | outside the range: boot fails. Shorter than a user takes to switch apps and sign in: links expire on the tap |
 
 - **`ONBOARDING__LINK_SECRET` must be identical on both services.** The worker signs and the
@@ -149,15 +149,18 @@ table):
 
 | Variable | Services | If wrong |
 |---|---|---|
-| `WHATSAPP__ALLOWED_PHONES` | api, worker | the invite list, for every channel: a number not on it in the form it arrives is told "invite-only". Compare `po-gowa hash +<number>` with `sender_hash` on `inbound.handled` |
-| `GOWA__ENABLED`, `GOWA__BASIC_AUTH_USER`, `GOWA__BASIC_AUTH_PASSWORD`, `GOWA__WEBHOOK_SECRET` | api (webhook secret), worker (the rest) | boot fails when missing; a mismatch with the gateway is `gowa.unhealthy` with status 401, or `gowa.signature_rejected` |
-| `GOWA__BASE_URL` | worker | a malformed URL (a stray space, a non-numeric port): `gowa.unhealthy`, `reason: bad_response`, `error_type: InvalidURL`. Plain `http://` to a host that is not `*.railway.internal` fails boot when deployed |
+| `WHATSAPP__ALLOWED_PHONES` | api, worker | the invite list, for every channel: a number not on it in the form it arrives is told "invite-only". Compare `po-gowa hash +<number>` with `sender_hash` on `inbound.handled`; the hash matches only with staging's `LOGGING__PII_PEPPER`, e.g. `railway run --service worker --environment staging uv run po-gowa hash +<number>` |
+| `GOWA__ENABLED`, `GOWA__BASIC_AUTH_USER`, `GOWA__BASIC_AUTH_PASSWORD`, `GOWA__WEBHOOK_SECRET` | api, worker: all of them, same values | boot fails on any service where one is missing; a mismatch with the gateway is `gowa.unhealthy` with status 401, or `gowa.signature_rejected` |
+| `GOWA__BASE_URL` | api, worker: same value (a deployed api fails boot on the default `http://localhost:3000`) | a malformed URL (an embedded space or a non-numeric port): `gowa.unhealthy`, `reason: bad_response`, `error_type: InvalidURL`. Plain `http://` to a host that is not `*.railway.internal` fails boot when deployed |
 | `GOWA__DEVICE_ID` | api, worker | leave unset with one device. A non-Latin-1 character: `gowa.unhealthy`, `reason: bad_response`, `error_type: UnicodeEncodeError` |
 
 ## 5. The end to end, on staging
 
-**Before you start:** `po-gowa status` against staging's gateway prints
-`connected=True logged_in=True`, and Sentry has no open `gowa.unhealthy` issue. Your number is
+**Before you start:** the gateway's own UI shows the device logged in, or `po-gowa status`
+run inside the staging worker (a laptop cannot reach `*.railway.internal` and would print
+`unreachable` while the gateway is fine: `railway ssh --service worker --environment staging`,
+then `po-gowa status`; check your Railway CLI's syntax) prints `connected=True logged_in=True`,
+and Sentry has no open `gowa.unhealthy` issue. Your number is
 on `WHATSAPP__ALLOWED_PHONES`, and you have not written to the bot since the migration (if
 you have, see "Starting over" below). Read logs with the CLI, since the dashboard shows JSON
 lines blank: `railway logs --service worker --environment staging --json`, and
@@ -207,7 +210,8 @@ lines blank: `railway logs --service worker --environment staging --json`, and
    In Composio → Connected accounts, the account is **ACTIVE** and its user id is the
    tenant's UUID, never a phone number.
 8. **Replay the link**: tap it again, or open it in another browser. The page says "Your
-   calendar is already connected", and nothing changes. (A link spent but not followed by a
+   calendar is already connected" (api log, info level: `connect.already_connected`; for a
+   late callback, `connect.callback_already_connected`), and nothing changes. (A link spent but not followed by a
    connection says "This link has expired" instead.)
 9. **Write again.** An active tenant gets the fixed acknowledgement (`disposition: allowed`)
    until the agent arrives.
@@ -314,10 +318,13 @@ Record the results as one bullet at the end of ADR 0004's Consequences, in this 
   logger at INFO or above that carries more than ids, and check whether the SDK sends
   telemetry (the connector switches it off per call). Either is a leak to fix before inviting
   anyone.
-- **What Sentry attached.** Sentry's default integrations attach request URLs to events. Open
-  an event from a connect route if one exists (or provoke one on staging with a bad
-  `/connect/callback?state=x`) and check the URL: `/connect/<token>` and `state=` must read
-  as scrubbed. A `ca_…` account id may appear in the URL; it is not personal data.
+- **What Sentry attached.** Sentry's default integrations attach request URLs to events and
+  traces. A bad `/connect/callback?state=x` creates no Sentry *event* (`bad_state` is a log
+  warning only, and logging events are off), so look under Traces (Performance) for a
+  `/connect/callback` transaction: request it about ten times, or temporarily raise
+  `SENTRY__TRACES_SAMPLE_RATE` (default `0.1`) on the api. Open one and check the URL data:
+  `/connect/<token>` and `state=` must read as scrubbed. A `ca_…` account id may appear in
+  the URL; it is not personal data.
 - **Hebrew on a real phone.** In the Hebrew run (step 5.2), read the onboarding texts and the
   connect pages on the phone: the digits, the zone name (`Asia/Jerusalem`) and the URL sit
   inside right-to-left text, where bidirectional rendering can reorder them. Note anything
@@ -370,13 +377,13 @@ the ops checklist below.
 | Symptom | Cause | Fix |
 |---|---|---|
 | an invited person still gets "Got it — I'm not smart yet" on their first message | `COMPOSIO__ENABLED` is not `true` on the **worker**: onboarding is gated on it | set it there too, with the full set |
-| an invited person gets the invite-only line | their number is not on the list in the form it arrives | compare `po-gowa hash +<number>` with `sender_hash` on `inbound.handled` |
+| an invited person gets the invite-only line | their number is not on the list in the form it arrives | compare `po-gowa hash +<number>` with `sender_hash` on `inbound.handled`, hashing with staging's `LOGGING__PII_PEPPER` (`railway run --service worker --environment staging uv run po-gowa hash +<number>`) |
 | an onboarded person gets the invite-only line | the chat moved to LID-only addressing; no tenant has that key | section 6, day-1 LID check |
 | no reply, worker logs `onboarding.unaddressable` | the sender has no phone on the message and the tenant has none on file | nothing to send to; the sender must write from a number we know |
 | worker logs `tenant.identity_conflict` | a sender key already belongs to another tenant; it is skipped, never reassigned | find the two tenants (`tenant_identities`); delete the stray one (Starting over) |
 | no reply at all | the gateway | Sentry `gowa.unhealthy`; `docs/runbook-whatsapp-gateway.md`, "When replies stop" |
-| every link page says the link is invalid | `ONBOARDING__LINK_SECRET` differs between api and worker | make them equal and redeploy both; then any message gets a fresh link |
-| the link page says it expired, or was used, on the first tap (410; api logs `connect.page_refused` or `connect.link_refused`) | older than `ONBOARDING__LINK_TTL_S` (15 min), or tapped before (in another browser, or by someone it was forwarded to) | write any message to the bot: it re-sends the latest usable link, or a fresh one |
+| every link, even a fresh one tapped at once, shows "This link has expired" (410; api logs `connect.page_refused`) | `ONBOARDING__LINK_SECRET` differs between api and worker | make them equal and redeploy both; then any message gets a fresh link |
+| the link page says "This link has expired" on the first tap (410; api logs `connect.page_refused` or `connect.link_refused`) | older than `ONBOARDING__LINK_TTL_S` (15 min), tapped before (in another browser, or by someone it was forwarded to), or `ONBOARDING__LINK_SECRET` differs between api and worker (then every link does this) | write any message to the bot: it re-sends the latest usable link, or a fresh one |
 | api answers 404 on `/connect/…` | `COMPOSIO__ENABLED` is not `true` on the api, or the api predates the connect code | set it, or deploy |
 
 ### Google and Composio
@@ -391,6 +398,7 @@ the ops checklist below.
 | the connect POST answers 503, api logs `connect.link_provider_rejected` (also a Sentry event) | our configuration: the API key or auth config id is wrong, or from different Composio projects | fix them (section 4) |
 | the connect POST answers 503, api logs `connect.link_provider_unavailable` | Composio is down or slow | retry; the link was spent, so write to the bot for a new one |
 | the callback page says "Calendar not connected" (400), api logs `connect.callback_refused` with `reason: bad_state`, `expired_state` or `bad_account_id` | no or tampered `state` (a stripped query), a `state` older than an hour, or an account id of the wrong shape | a fresh link; if it recurs at once, the `?state=` round trip is broken (section 6) |
+| same page, `reason: tenant_unavailable` | the tenant was deleted ("Starting over") or is in an unexpected status while the callback lands | send the bot a fresh message |
 | same page, `reason: user_mismatch`, `auth_config_mismatch` or `not_active` | the account is not this tenant's, was made under another auth config (the API key and the config id from different Composio projects), or is not `ACTIVE` | the same Composio project for both; then a fresh link |
 | "Not connected yet", api logs `reason: not_ready` | Composio still has the account INITIATED/INITIALIZING | reload in a few seconds |
 | the callback answers 400 and api logs `connect.callback_provider_rejected` | Composio does not know that account id (a guess or a stale one) | nothing, unless it hits a real user: a fresh link |
@@ -406,7 +414,8 @@ the ops checklist below.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Sentry issue `gowa.unhealthy` | the gateway cannot carry messages; the `reason` tag says why | `docs/runbook-whatsapp-gateway.md`, "When replies stop"; then resolve the issue |
-| `gowa.unhealthy` with `reason: bad_response`, `error_type` `InvalidURL` or `UnicodeEncodeError`, and no `status_code` | the worker never reached the gateway: the request was malformed before it was sent | check `GOWA__BASE_URL` (a stray space, a bad port) and `GOWA__DEVICE_ID` (a non-Latin-1 character) on the worker |
+| `gowa.unhealthy` with `reason: bad_response`, `error_type` `InvalidURL` or `UnicodeEncodeError`, and no `status_code` | the worker never reached the gateway: the request was malformed before it was sent | check `GOWA__BASE_URL` (an embedded space or a non-numeric port) and `GOWA__DEVICE_ID` (a non-Latin-1 character) on the worker |
+| Sentry quota: the issue fires once per 5 minutes while unhealthy (288 events a day) | the gateway is parked or down for a while | set `GOWA__ENABLED=false` on the worker (and api) instead of leaving the issue firing |
 | worker logs `Task was not found` for `system:gowa_health`, once | GOWA was switched off on the worker while a check was queued | nothing: it is registered only with GOWA on |
 
 ## Ops checklist

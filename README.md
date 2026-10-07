@@ -18,7 +18,7 @@ dedicated SIM as a WhatsApp Web device while Meta's business verification is pen
 | | |
 |---|---|
 | `src/personal_organizer/api/` | FastAPI service. `/health` (liveness), `/ready` (readiness, monitoring only), `/webhooks/whatsapp` and `/webhooks/gowa` (each when enabled), `/connect/*` (when Composio is enabled). |
-| `src/personal_organizer/worker/` | Procrastinate worker and task registry, including `system:gowa_health`, the gateway health alarm (a failed check logs `gowa.unhealthy` at error level, which Sentry groups into one issue). |
+| `src/personal_organizer/worker/` | Procrastinate worker and task registry, including `system:gowa_health`, the gateway health alarm (a failed check logs `gowa.unhealthy` and reports it to Sentry as one issue). |
 | `src/personal_organizer/db/` | Async engines per role, tenant-scoped sessions, bootstrap, `po-db`, ORM models, and `repositories/`: tenant-scoped queries, each also filtered through `scoped()`. |
 | `src/personal_organizer/messaging/` | Provider-neutral ingress (persist-then-ack), the invite and onboarding gate, numbered choices, at-most-once replies. |
 | `src/personal_organizer/onboarding/` | Signed, single-use connect links and the /connect page texts. |

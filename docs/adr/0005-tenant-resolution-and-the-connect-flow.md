@@ -159,8 +159,8 @@ point:
   never arrived would be stuck for good. The common result is an **unbound** `ACTIVE` account
   at Composio, holding Google tokens, with no `calendar_connections` row at all. A revoked row
   is the rare case: there is no reconnect flow yet (an active tenant's link gets "already
-  connected"), so the only revoke today is a second account bound by a callback arriving
-  within the state's hour, when `bind_connection` marks the old row `revoked`. Either way a
+  connected"), so the only revoke today (besides the manual reconnect SQL in the runbook) is a second
+  account bound by a callback arriving within the state's hour, when `bind_connection` marks the old row `revoked`. Either way a
   tenant has at most one active row, but Composio may hold more accounts than we do.
   **The calendar-read iteration must name the bound `connected_account_id` on every call,
   never "the user's account", and must disable or delete superseded or orphaned accounts
@@ -170,8 +170,9 @@ point:
 
 ### Day-1 results (Composio with our own Google client)
 
-Recorded from `docs/runbook-iteration-03.md` section 6 once they are run: whether the
-connect link passes Google's unverified-app screen and returns `ACTIVE`; the names of the
-callback's query parameters (`connected_account_id` or `connectedAccountId`) and that `state`
-survives the round trip; what a second connect attempt does; and whether the SDK logs request bodies or
-sends telemetry.
+Recorded from `docs/runbook-iteration-03.md` section 6 once they are run, all eight items:
+the unverified-app warning screen and `ACTIVE`; Google sign-in inside WhatsApp's in-app
+browser; the names of the callback's query parameters (`connected_account_id` or
+`connectedAccountId`); that `state` survives the round trip; what a second connect attempt
+does (a reconnect); whether the SDK logs request bodies or sends telemetry; what Sentry
+attached to a connect-route event or trace; and how the Hebrew texts render on a real phone.

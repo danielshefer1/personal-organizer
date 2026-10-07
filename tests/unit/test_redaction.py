@@ -206,7 +206,17 @@ class TestConnectUrls:
         )
 
     @pytest.mark.parametrize(
-        "value", ["/connect/{token}", "/connect/callback", "/webhooks/gowa", "disconnect/now"]
+        "value",
+        [
+            "/connect/{token}",
+            "/connect/callback",
+            "/webhooks/gowa",
+            "disconnect/now",
+            "https://x/connect%2Fcallback%3Fok%3D1",
+            "https://x/cb?next=%2Fcb%3Festate%3D1",
+            "estate=1",
+            "/CONNECT/Callback",
+        ],
     )
     def test_route_templates_and_other_paths_survive(self, value: str) -> None:
         assert scrub_text(value) == value
@@ -220,3 +230,25 @@ class TestConnectUrls:
         assert connection_id in _render(
             {"event": "connect.connected", "connection_id": connection_id}
         )
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "https://x/cb?next=%2Fcb%3Fstate%3D{t}",
+            "https://x/cb?next=%2Fcb%3Fstate%3D{t}%26connected_account_id%3Dca_1",
+            "Referer: https://po.test/connect/callback?State={t}&a=1",
+            "STATE%3d{t}",
+            "https://po.test/Connect/{t}",
+            "https://x/cb?next=%2Fconnect%2F{t}%3Fa%3D1",
+            "https://x/cb?next=%2FCONNECT%2F{t}",
+        ],
+    )
+    def test_encoded_and_mixed_case_forms_are_removed(self, value: str) -> None:
+        token = "eyJ0IjoiMSJ9.asYPQA.u24jXyZ-signature_value"
+        scrubbed = scrub_text(value.format(t=token))
+        for part in token.split("."):
+            assert part not in scrubbed
+
+    def test_an_encoded_account_id_is_kept(self) -> None:
+        scrubbed = scrub_text("x%2Fcb%3Fstate%3Dabc%26connected_account_id%3Dca_1")
+        assert scrubbed.endswith("%26connected_account_id%3Dca_1")

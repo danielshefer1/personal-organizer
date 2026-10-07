@@ -241,8 +241,15 @@ _CALL_STRING = re.compile(r"([\w.:-]+\[\d+\])\([^)]*\)")
 # callback our signed state in its query (?state=<token>). The token rules below would catch
 # today's shape by length; these catch it by position. A route template (/connect/{token}) and
 # the callback path itself are kept.
-_CONNECT_TOKEN = re.compile(r"(/connect/)(?!callback\b|\{)[^/?#\s\"'<>]+")
-_STATE_PARAM = re.compile(r"(\bstate=)[^&#\s\"'<>]+")
+# The same two shapes percent-encoded, as they appear in a ``next=`` value or a Referer, and in
+# any case. A token never contains ``%``, so the value class stops at an encoded separator.
+_CONNECT_TOKEN = re.compile(
+    r"((?:/|%2F)connect(?:/|%2F))(?!callback\b|\{|%7B)[^/?#%&\s\"'<>]+", re.IGNORECASE
+)
+_STATE_PARAM = re.compile(
+    r"((?:(?<![A-Za-z0-9])|(?<=%[0-9A-F][0-9A-F]))state(?:=|%3D))(?:(?!%26)[^&#\s\"'<>])+",
+    re.IGNORECASE,
+)
 
 
 def _luhn_ok(digits: str) -> bool:

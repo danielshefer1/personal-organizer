@@ -456,6 +456,18 @@ class TestOnboardingLinks:
         with pytest.raises(ValidationError):
             settings_factory(ONBOARDING__LINK_TTL_S=ttl)
 
+    def test_the_bot_phone_is_optional_and_normalised(self, settings_factory: Any) -> None:
+        assert settings_factory().onboarding.bot_phone is None
+        cfg = settings_factory(ONBOARDING__BOT_PHONE="+972 50-123-4567")
+        assert cfg.onboarding.bot_phone == "+972501234567"
+
+    def test_an_invalid_bot_phone_fails_boot_without_echoing_it(
+        self, settings_factory: Any
+    ) -> None:
+        with pytest.raises(ValidationError, match="BOT_PHONE") as excinfo:
+            settings_factory(ONBOARDING__BOT_PHONE="0501234567")
+        assert "0501234567" not in str(excinfo.value)
+
 
 class TestThePlatformGuard:
     """`APP__ENV` is what every other check is gated on, so it cannot be optional.

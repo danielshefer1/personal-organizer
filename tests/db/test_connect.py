@@ -10,11 +10,13 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import UUID
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from structlog.testing import capture_logs
 
+from personal_organizer.api.app import create_app
 from personal_organizer.core.errors import CalendarProviderUnavailableError
 from personal_organizer.core.types import TenantId
 from personal_organizer.db.engine import Database
@@ -25,6 +27,7 @@ from personal_organizer.messaging.onboarding_text import t
 from personal_organizer.onboarding.connected import announce_connected
 from personal_organizer.onboarding.page_text import page_text
 from personal_organizer.onboarding.tokens import LINK_SALT, STATE_SALT, verify
+from personal_organizer.providers.calendar.composio import ComposioConnector
 from personal_organizer.settings import Settings
 from personal_organizer.worker.tasks.onboarding import ONBOARDING_CONNECTED_TASK
 from tests.api.conftest import DeferredCall, FakeProcrastinate
@@ -608,3 +611,26 @@ class TestCallback:
         ]
         assert queue.calls == []
         assert (await tenant_row(db, tenant_id)).status == "onboarding"
+
+
+def _no_network(*_args: object, **_kwargs: object) -> httpx.Response:
+    msg = "the lifespan must not call Composio"
+    raise AssertionError(msg)
+
+
+class TestLifespan:
+    """``tests/api`` stubs ``app.state.connect_linker``; here the real lifespan builds it."""
+
+    async def test_composio_enabled_builds_the_connector(
+        self, connect_settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(httpx.Client, "send", _no_network)
+        application = create_app(connect_settings)
+        async with application.router.lifespan_context(application):
+            assert isinstance(application.state.connect_linker, ComposioConnector)
+
+    async def test_composio_disabled_builds_none(self, db_settings: Settings) -> None:
+        assert not db_settings.composio.enabled
+        application = create_app(db_settings)
+        async with application.router.lifespan_context(application):
+            assert not hasattr(application.state, "connect_linker")

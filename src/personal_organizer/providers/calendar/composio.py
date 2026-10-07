@@ -51,9 +51,10 @@ from personal_organizer.settings import ComposioSettings
 _TRANSIENT_STATUSES: Final = frozenset({408, 409, 429})
 #: One retry, for a quick 5xx. A slow failure uses up the deadline before a retry could finish.
 _SDK_MAX_RETRIES: Final = 1
-#: Worker threads for SDK calls. A call past its deadline is abandoned, not killed, and keeps its
-#: thread until the SDK gives up. Sharing anyio's default pool (40) would let a slow Composio
-#: starve every other thread user, so the connector gets its own, small, pool.
+#: Worker threads for SDK calls: at most four in flight, drawn from this limiter rather than
+#: anyio's shared default (40), so a slow Composio cannot take the threads every other
+#: ``to_thread`` user waits on. It does not cap abandoned calls: anyio releases the token when a
+#: call past its deadline is abandoned, and that call keeps its thread until the SDK gives up.
 SDK_LIMITER: Final = anyio.CapacityLimiter(4)
 
 

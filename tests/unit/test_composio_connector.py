@@ -243,7 +243,9 @@ class TestQuiet:
         assert logging.getLogger("composio").getEffectiveLevel() >= logging.WARNING
 
 
-class TestFixRound1:
+class TestNothingLeaks:
+    """The SDK's messages are response bodies, and Sentry sends ``__cause__``."""
+
     async def test_the_sdks_error_is_not_chained_into_ours(self) -> None:
         body = {"error": {"message": "DISTINCTIVE-BODY-TEXT for user"}}
         api = Api({account_route("ca_x"): lambda: httpx.Response(400, json=body, headers=NO_RETRY)})
@@ -263,6 +265,8 @@ class TestFixRound1:
         assert raised.value.status_code is None
         assert raised.value.__cause__ is None
 
+
+class TestThreads:
     async def test_calls_borrow_the_connectors_own_limiter(self) -> None:
         seen: list[int] = []
 

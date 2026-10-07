@@ -21,7 +21,7 @@ from sqlalchemy import CheckConstraint, ForeignKey, Index, Text, UniqueConstrain
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from personal_organizer.db.base import Base
+from personal_organizer.db.base import Base, check_in
 
 #: Outbox states in the only order they may move through. Delivery updates arrive out of
 #: order and are redelivered, so a status write only ever moves *forward* in this list --
@@ -42,10 +42,6 @@ DISPOSITIONS: Final = ("allowed", "stranger", "stranger_muted", "stale")
 _GEN_UUID = text("gen_random_uuid()")
 
 
-def _in(column: str, values: tuple[str, ...]) -> str:
-    return f"{column} IN ({', '.join(repr(value) for value in values)})"
-
-
 class ChannelInbox(Base):
     __tablename__ = "channel_inbox"
     __table_args__ = (
@@ -53,7 +49,7 @@ class ChannelInbox(Base):
         # even when nothing failed; ON CONFLICT on this constraint is what makes that safe.
         UniqueConstraint("channel", "provider_message_id"),
         CheckConstraint("sender_user_id IS NOT NULL OR sender_phone IS NOT NULL", name="sender"),
-        CheckConstraint(_in("disposition", DISPOSITIONS), name="disposition"),
+        CheckConstraint(check_in("disposition", DISPOSITIONS), name="disposition"),
         Index(None, "sender_key"),
     )
 
@@ -89,7 +85,7 @@ class ChannelOutbox(Base):
         UniqueConstraint("inbox_id", "kind"),
         # NULLs are distinct in a unique constraint, so rows not yet accepted do not collide.
         UniqueConstraint("channel", "provider_message_id"),
-        CheckConstraint(_in("status", OUTBOX_STATUS_ORDER), name="status"),
+        CheckConstraint(check_in("status", OUTBOX_STATUS_ORDER), name="status"),
         Index(None, "recipient_key", "kind", "created_at"),
     )
 

@@ -88,17 +88,21 @@ async def primary_phone(session: AsyncSession, tenant_id: UUID) -> str | None:
 
 async def add_identity(
     session: AsyncSession, tenant_id: UUID, *, network: str, external_id: str, phone: str | None
-) -> None:
-    """Record another key for a known tenant (D12). A no-op when the key is already recorded.
+) -> bool:
+    """Record another key for a known tenant (D12). ``True`` if it was inserted.
 
-    Run inside ``tenant_session(tenant_id)``: the policy's ``WITH CHECK`` is what stops a key
-    from being attached to anyone else.
+    Run inside ``tenant_session(tenant_id)``: the policy's ``WITH CHECK`` refuses a row for a
+    different ``tenant_id``. A key already owned by anyone -- this tenant or another -- is
+    skipped by the unique constraint and ``DO NOTHING`` and reported as ``False``. Telling
+    "mine" from "someone else's" is the caller's job (``resolve_tenant``).
     """
-    await session.execute(
+    inserted: UUID | None = await session.scalar(
         insert(TenantIdentity)
         .values(tenant_id=tenant_id, network=network, external_id=external_id, phone=phone)
         .on_conflict_do_nothing(index_elements=["network", "external_id"])
+        .returning(TenantIdentity.id)
     )
+    return inserted is not None
 
 
 __all__ = [

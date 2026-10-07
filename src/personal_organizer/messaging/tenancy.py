@@ -26,6 +26,7 @@ from types import MappingProxyType
 from typing import Final
 from uuid import UUID
 
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from personal_organizer.core.types import TenantId
@@ -40,6 +41,8 @@ from personal_organizer.db.repositories.tenants import (
     resolve_tenant,
 )
 from personal_organizer.messaging.inbox import InboxRow
+
+log = structlog.get_logger(__name__)
 
 #: Channel name -> identity network. A future Telegram channel maps to ``"telegram"``.
 _NETWORKS: Final = MappingProxyType({"whatsapp": NETWORK_WHATSAPP, "gowa": NETWORK_WHATSAPP})
@@ -87,16 +90,27 @@ async def _first_match(
     return None
 
 
-async def _link(
-    db: Database, tenant_id: UUID, network: str, keys: tuple[str, ...], phone: str | None
-) -> None:
+async def _link(db: Database, tenant_id: UUID, row: InboxRow, keys: tuple[str, ...]) -> None:
+    """Add ``keys`` to the tenant. A key that exists and is *not* this tenant's is logged."""
+    network = network_for(row.channel)
+    skipped: list[str] = []
     async with db.tenant_session(TenantId(tenant_id)) as session:
         for key in keys:
-            await add_identity(session, tenant_id, network=network, external_id=key, phone=phone)
+            added = await add_identity(
+                session, tenant_id, network=network, external_id=key, phone=row.sender_phone
+            )
+            if not added:
+                skipped.append(key)
+    for key in skipped:
+        async with db.system_session() as session:
+            owner = await resolve_tenant(session, network=network, external_id=key)
+        if owner != tenant_id:
+            # No key, phone or uid in the log: only allowlisted fields.
+            log.warning("tenant.identity_conflict", tenant_id=str(tenant_id), channel=row.channel)
 
 
 async def resolve_sender(db: Database, row: InboxRow) -> UUID | None:
-    """The tenant this message is from, or ``None``. Records any stronger key it was missing."""
+    """The tenant this message is from, or ``None``. Records any of its keys not yet recorded."""
     network = network_for(row.channel)
     keys = identity_keys(row)
     async with db.system_session() as session:
@@ -104,25 +118,36 @@ async def resolve_sender(db: Database, row: InboxRow) -> UUID | None:
     if found is None:
         return None
     tenant_id, index = found
-    if index > 0:
-        await _link(db, tenant_id, network, keys[:index], row.sender_phone)
+    others = keys[:index] + keys[index + 1 :]
+    if others:
+        await _link(db, tenant_id, row, others)
     return tenant_id
 
 
 async def enrol(db: Database, row: InboxRow, *, language: str) -> UUID:
-    """Create the tenant for an invited sender. Idempotent on the identity key."""
+    """Create the tenant for an invited sender. Idempotent on the identity key.
+
+    Call only after :func:`resolve_sender` returned ``None``. The tenant is created on the
+    ``tel:`` key whenever the sender has a number (an invited sender always does): the gateway
+    and Meta see one person under different first keys, and two first messages racing on
+    different channels must meet at the same ``create_tenant`` call, whose race-safety is on
+    one key. Creating on ``uid:`` here would let both win and split the person in two. The
+    remaining keys are then linked.
+    """
     network = network_for(row.channel)
     keys = identity_keys(row)
+    first = f"tel:{row.sender_phone}" if row.sender_phone else keys[0]
     async with db.system_session() as session:
         tenant_id = await create_tenant(
             session,
             network=network,
-            external_id=keys[0],
+            external_id=first,
             phone=row.sender_phone,
             language=language,
         )
-    if len(keys) > 1:
-        await _link(db, tenant_id, network, keys[1:], row.sender_phone)
+    rest = tuple(key for key in keys if key != first)
+    if rest:
+        await _link(db, tenant_id, row, rest)
     return tenant_id
 
 

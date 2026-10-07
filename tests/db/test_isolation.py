@@ -291,6 +291,23 @@ async def test_an_account_bound_to_b_cannot_be_bound_to_a(
     assert after == before
 
 
+async def test_a_key_owned_by_b_is_skipped_not_attached_to_a(
+    database: Database, app_conn: Any, seeded: Seeded
+) -> None:
+    """``add_identity`` under A with a key B owns: ``False``, no error, B untouched."""
+    before = await _snapshot(app_conn, seeded.b)
+    async with database.tenant_session(TenantId(seeded.a)) as session:
+        added = await tenants.add_identity(
+            session,
+            seeded.a,
+            network=NETWORK_WHATSAPP,
+            external_id=f"tel:{PHONES['b']}",
+            phone=PHONES["b"],
+        )
+    assert added is False
+    assert await _snapshot(app_conn, seeded.b) == before
+
+
 # --- 2. WITH CHECK ------------------------------------------------------------------------
 
 

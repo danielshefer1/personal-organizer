@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
+from structlog.testing import capture_logs
 
 from personal_organizer.core.types import TenantId
 from personal_organizer.db.engine import Database
@@ -60,6 +62,20 @@ async def _resolve(db: Database, key: str) -> Any:
         return await resolve_tenant(session, network=NETWORK_WHATSAPP, external_id=key)
 
 
+async def _tenant_and_identity_counts(conn: Any) -> tuple[int, int]:
+    """Counted past RLS, as ``app_definer`` (as PR 2's concurrent create test does)."""
+    async with conn.transaction():
+        await conn.execute("SET LOCAL ROLE app_definer")
+        return (
+            await conn.fetchval("SELECT count(*) FROM tenants"),
+            await conn.fetchval("SELECT count(*) FROM tenant_identities"),
+        )
+
+
+async def _wipe(conn: Any) -> None:
+    await conn.execute("TRUNCATE tenants CASCADE")
+
+
 class TestIdentities:
     async def test_an_unknown_sender_resolves_to_nothing(
         self, db: Database, owner_conn: Any
@@ -95,6 +111,62 @@ class TestIdentities:
     async def test_enrol_is_idempotent(self, db: Database, owner_conn: Any) -> None:
         row = await _row(db, owner_conn, user_id="US.1", channel="whatsapp")
         assert await enrol(db, row, language="en") == await enrol(db, row, language="he")
+
+    async def test_a_meta_message_for_a_gateway_tenant_links_the_uid(
+        self, db: Database, owner_conn: Any
+    ) -> None:
+        tenant_id = await enrol(db, await _row(db, owner_conn, channel="gowa"), language="en")
+        meta = await _row(db, owner_conn, user_id="US.1", channel="whatsapp")
+        assert await resolve_sender(db, meta) == tenant_id
+        assert await _resolve(db, "uid:US.1") == tenant_id
+        assert await _tenant_and_identity_counts(owner_conn) == (1, 2)
+
+    async def test_a_uid_tenant_writing_from_a_new_phone_gets_the_tel_linked(
+        self, db: Database, owner_conn: Any
+    ) -> None:
+        first = await _row(db, owner_conn, user_id="US.1", phone=None, channel="whatsapp")
+        tenant_id = await enrol(db, first, language="en")
+        assert await _resolve(db, f"tel:{NL_PHONE}") is None
+        with_phone = await _row(db, owner_conn, user_id="US.1", channel="whatsapp")
+        assert await resolve_sender(db, with_phone) == tenant_id
+        assert await _resolve(db, f"tel:{NL_PHONE}") == tenant_id
+
+    async def test_first_messages_on_both_channels_at_once_make_one_tenant(
+        self, db: Database, owner_conn: Any
+    ) -> None:
+        """Jobs for ``tel:`` and ``uid:`` keys are serialized apart, so they can race."""
+        gowa = await _row(db, owner_conn, channel="gowa")
+        meta = await _row(db, owner_conn, user_id="US.1", channel="whatsapp")
+
+        async def first_message(row: InboxRow) -> UUID:
+            found = await resolve_sender(db, row)
+            return found if found is not None else await enrol(db, row, language="en")
+
+        for _ in range(5):
+            ids = await asyncio.gather(first_message(gowa), first_message(meta))
+            assert ids[0] == ids[1]
+            assert await _tenant_and_identity_counts(owner_conn) == (1, 2)
+            await _wipe(owner_conn)
+
+    async def test_a_key_owned_by_another_tenant_is_logged_without_identifiers(
+        self, db: Database, owner_conn: Any
+    ) -> None:
+        a = await enrol(db, await _row(db, owner_conn, channel="gowa"), language="en")
+        b = await enrol(
+            db,
+            await _row(db, owner_conn, user_id="US.9", phone=None, channel="whatsapp"),
+            language="en",
+        )
+        assert a != b
+        clash = await _row(db, owner_conn, user_id="US.9", channel="whatsapp")
+        with capture_logs() as logs:
+            assert await resolve_sender(db, clash) == b
+        conflicts = [entry for entry in logs if entry["event"] == "tenant.identity_conflict"]
+        assert len(conflicts) == 1
+        assert set(conflicts[0]) <= {"event", "log_level", "tenant_id", "channel"}
+        assert NL_PHONE not in str(logs)
+        assert "US.9" not in str(logs)
+        assert await _resolve(db, f"tel:{NL_PHONE}") == a
 
 
 class TestState:

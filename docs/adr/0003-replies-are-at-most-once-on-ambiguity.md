@@ -45,3 +45,8 @@ one, and far better than a duplicated reminder or a doubled calendar confirmatio
   Giving each chunk its own outbox row — a distinct `kind` per chunk, since the claim is
   unique on `(inbox_id, kind)` — lets a partly delivered reply resume at the first unsent
   chunk rather than starting over.
+- From Iteration 03 a send that answers no inbound message claims on
+  `channel_outbox.idempotency_key` instead (D6). The first is "You're all set" under
+  `connected:<connection_id>`, and reminders will follow. The states and the rule are the same.
+  The key names the event, is unique across kinds and never carries content.
+  `tests/db/test_outbox.py` pins the same paths for it.

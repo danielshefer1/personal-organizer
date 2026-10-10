@@ -10,9 +10,12 @@ Sender                                Outcome (disposition)
 ====================================  ======================================================
 resolves to an ``active`` tenant      ``on_allowed`` (``allowed``)
 resolves to an ``onboarding`` tenant  the current onboarding step (``onboarding``)
-no tenant, number on the invite list  ``enrol``, then the first step (``onboarding``)
+no tenant, number invited             ``enrol``, then the first step (``onboarding``)
 anything else, suspended included     invite-only reply and purge (``stranger[_muted]``)
 ====================================  ======================================================
+
+"Invited" is :func:`~personal_organizer.messaging.invites.is_invited`: on
+``WHATSAPP__ALLOWED_PHONES``, or holding an open invite in ``invites`` (ADR 0006).
 
 What both guarantee is the part that must hold before there *is* an agent. A sender who is
 not invited never reaches ``on_allowed``, the seam Iteration 04 turns into "defer an agent
@@ -60,6 +63,7 @@ from personal_organizer.db.repositories.messages import record_inbound
 from personal_organizer.db.repositories.tenants import set_onboarding_step, set_timezone
 from personal_organizer.interfaces.channel import OutboundChannel
 from personal_organizer.messaging.inbox import InboxRow, load_row
+from personal_organizer.messaging.invites import is_invited
 from personal_organizer.messaging.language import detect_language
 from personal_organizer.messaging.onboarding import Advance, onboarding_step
 from personal_organizer.messaging.outbox import send_once
@@ -226,7 +230,7 @@ async def _allowlist_gate(
     on_allowed: OnAllowed,
 ) -> str:
     """Iteration 02's gate, kept exactly for environments without Composio."""
-    allowed = row.sender_phone is not None and row.sender_phone in allowlist
+    allowed = await is_invited(db, row.sender_phone, allowlist)
     if _is_stale(row, current):
         disposition = "stale"
     elif allowed:
@@ -252,8 +256,8 @@ async def _tenant_gate(
     """D2: serve, onboard, enrol or turn away. See the module docstring's table."""
     stale = _is_stale(row, current)
     tenant_id = await resolve_sender(db, row)
-    invited = row.sender_phone is not None and row.sender_phone in allowlist
-    if tenant_id is None and invited and not stale:
+    # Asked only for a sender with no tenant: identity wins over invites.
+    if tenant_id is None and not stale and await is_invited(db, row.sender_phone, allowlist):
         # Their first message. Its words decide the tenant's language (D11).
         tenant_id = await enrol(db, row, language=detect_language(row.body))
     tenant = await load_state(db, tenant_id) if tenant_id is not None else None

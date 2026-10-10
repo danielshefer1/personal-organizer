@@ -358,6 +358,21 @@ class OnboardingSettings(BaseModel):
     #: Long enough to switch apps and sign in to Google; short enough that a forwarded
     #: screenshot of the link has gone stale.
     link_ttl_s: int = Field(default=900, ge=60, le=3600)
+    #: The number invitees write to, E.164 -- today the GOWA SIM. Only ``po-admin invite``
+    #: reads it, to print a ``wa.me`` link; unset, the invite is still recorded.
+    bot_phone: str | None = None
+
+    @field_validator("bot_phone")
+    @classmethod
+    def _bot_phone_is_e164(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        phone = normalise_e164(value)
+        if phone is None:
+            # Not echoed: hide_input_in_errors covers pydantic's part, and this is ours.
+            msg = "ONBOARDING__BOT_PHONE is not an E.164 number"
+            raise ValueError(msg)
+        return phone
 
     @model_validator(mode="after")
     def _long_enough(self) -> OnboardingSettings:

@@ -169,3 +169,19 @@ async def test_the_tenants_downgrade_round_trips(owner_conn: Any) -> None:
     finally:
         command.upgrade(config, "head")
         await owner_conn.execute("TRUNCATE channel_outbox, channel_inbox CASCADE")
+
+
+_INVITES_SQL = "SELECT to_regclass('public.invites')::text"
+
+
+async def test_the_invites_downgrade_round_trips(owner_conn: Any) -> None:
+    """0005 down and up again; the up must re-revoke DELETE (checked by the repository suite,
+    which runs at head)."""
+    config = _config()
+    try:
+        command.downgrade(config, "0004_tenants")
+        assert await owner_conn.fetchval(_INVITES_SQL) is None
+        command.upgrade(config, "head")
+        assert await owner_conn.fetchval(_INVITES_SQL) == "invites"
+    finally:
+        command.upgrade(config, "head")

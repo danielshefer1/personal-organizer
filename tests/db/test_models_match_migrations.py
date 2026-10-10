@@ -48,14 +48,15 @@ def test_models_match_the_migrated_schema(db_settings: Settings, owner_conn: Any
     assert diff == [], f"models and migrations disagree: {diff}"
 
 
-async def test_channel_ledgers_are_not_tenant_tables(app_conn: Any) -> None:
-    """Written before a tenant is known, so no RLS -- which also means a stray policy on
-    them would silently hide every row from the worker."""
+async def test_tables_written_before_a_tenant_is_known_have_no_rls(app_conn: Any) -> None:
+    """The channel ledgers and ``invites`` exist before their tenant does, so no RLS --
+    which also means a stray policy on them would silently hide every row from the worker."""
     rows = await app_conn.fetch(
         "SELECT relname, relrowsecurity FROM pg_class "
-        "WHERE relname IN ('channel_inbox', 'channel_outbox')"
+        "WHERE relname IN ('channel_inbox', 'channel_outbox', 'invites')"
     )
     assert {row["relname"]: row["relrowsecurity"] for row in rows} == {
         "channel_inbox": False,
         "channel_outbox": False,
+        "invites": False,
     }
